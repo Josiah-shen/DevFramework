@@ -1,0 +1,10 @@
+{
+  "_note": "模板占位 — 新项目请列出要检查的端点；e2e 场景见 e2e_config.json",
+  "endpoints": [
+    {
+      "url": "http://localhost:${BACKEND_PORT:-8088}/actuator/health",
+      "method": "GET",
+      "status": 200
+    }
+  ]
+}

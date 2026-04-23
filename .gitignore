@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Node
+node_modules/
+dist/
+*.log
+npm-debug.log*
+
+# Java / Maven
+target/
+*.class
+*.jar
+*.war
+
+# Backups / temp
+.src.backup-*/
+*.bak
+*.tmp
+
+# Env
+.env
+.env.local
+
+# Claude Code local state
+.claude/
+
+# Personal notes
+待办.md

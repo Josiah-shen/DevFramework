@@ -1,0 +1,1 @@
+"""Harness engines: creator (infrastructure auditor/builder) and executor (task lifecycle gatekeeper)."""

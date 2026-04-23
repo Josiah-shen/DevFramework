@@ -1,0 +1,29 @@
+{
+  "name": "xptsqas-frontend",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.1.0",
+    "@vueuse/core": "^10.3.0",
+    "axios": "^1.4.0",
+    "echarts": "^5.4.3",
+    "element-plus": "^2.3.14",
+    "pinia": "^2.1.6",
+    "vue": "^3.3.4",
+    "vue-echarts": "^6.6.1",
+    "vue-router": "^4.2.4"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^4.3.4",
+    "@vitest/coverage-v8": "^4.1.4",
+    "vite": "^4.4.9",
+    "vitest": "^4.1.4"
+  }
+}
