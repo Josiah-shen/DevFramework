@@ -1,3 +1,12 @@
+## 父代理角色
+父代理（主会话）在本项目内**即是 coordinator**，职责与约束以 @.claude/roles/coordinator.md 为准：
+- 默认只做规划、委派、汇总，不直接 Edit/Write/Bash
+- 逃生口：任务满足"一句话可描述 **且** 描述中不含'和'字"时，父代理可直接动手
+- 每次新任务先检查 `harness/tasks/{task-slug}/checkpoint.md`，有则从中断处恢复
+- 标准流程：理解拆解 → 构造 prompt → 委派等待 → 机械验证（verifier）→ 交叉 review（按需）→ 复现检测（critic）→ 汇总
+
+@.claude/roles/coordinator.md
+
 ## 快速链接
 - [架构总览](docs/ARCHITECTURE.md) — 分层规则、数据流
 - [开发指南](docs/DEVELOPMENT.md) — 构建、测试、lint 命令
@@ -13,7 +22,7 @@
 - 失败早退：`validate.py` 对连续两轮相同失败指纹自动跳过剩余重试，避免浪费时间在确定性问题上。
 - 简单任务（单文件小改、不跨层、修改 < 3 个文件）可跳过引擎，直接按 coordinator 流程。
 - 拆分类任务请先阅读 `harness/split-task-checklist.md`。
-- Worktree 依赖自愈：`executor init` / `verify` 会自动把 `src/frontend/node_modules`、`src/backend/target` 软链到主仓；若主仓尚未构建过对应目录会打印 `[worktree-deps]` 告警，此时请在主仓执行 `make build` 后再回 worktree。手动兜底命令见 `harness/split-task-checklist.md` 第 1 节。
+- Worktree 依赖自愈：`executor init` / `verify` 仅把 `src/frontend/node_modules` 软链到主仓（只读依赖共享）；`src/backend/target` 与前端 vite/vitest 缓存（`src/frontend/.vite-cache`、`.vitest-cache`）每个 worktree 独立，支持多 worktree 并行构建。若主仓尚未构建过 `node_modules` 会打印 `[worktree-deps]` 告警，此时请在主仓执行 `pnpm install` / `make build` 后再回 worktree。手动兜底命令见 `harness/split-task-checklist.md` 第 1 节。
 ## 构建命令
 make build      # 构建项目
 make test       # 运行测试

@@ -1,0 +1,139 @@
+{
+  "language": "chinese",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(* mvn spring-boot:run*)",
+            "command": "cmd=$(jq -r '.tool_input.command // empty'); echo \"$cmd\" | grep -q 'mvn spring-boot:run' || exit 0; lsof -ti :8088 | xargs kill -9 2>/dev/null; true",
+            "statusMessage": "杀掉 8088 端口旧进程...",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Write(src/database/**)",
+            "command": "jq -r '.tool_input.file_path // empty' | grep -qE '(schema|init-data)\\.sql$' && printf '{\"systemMessage\": \"schema.sql/init-data.sql 已变更，请确认 src/database/init.sql 和 init-data.sql 是否需要同步更新\"}' || true",
+            "statusMessage": "检查数据库文件同步..."
+          },
+          {
+            "type": "agent",
+            "if": "Write(docs/design-docs/**)",
+            "prompt": "你是 docs-updater 代理。docs/design-docs/ 下有文件刚刚变更。执行步骤：1) 用 Glob 列出 docs/design-docs/ 下所有文件并逐一 Read；2) 从中提炼项目简介、核心用户、关键业务流程、成功指标四类信息；3) 用 Edit 更新 docs/PRODUCT_SENSE.md，保持章节结构不变，用真实内容替换占位符。若 design-docs 为空则不修改 PRODUCT_SENSE.md。",
+            "statusMessage": "docs-updater：同步 PRODUCT_SENSE.md...",
+            "timeout": 120
+          },
+          {
+            "type": "command",
+            "if": "Write(src/**)",
+            "command": "make lint-arch 2>&1",
+            "statusMessage": "lint-arch：检查分层依赖...",
+            "timeout": 30
+          },
+          {
+            "type": "agent",
+            "if": "Write(src/**)",
+            "prompt": "你是需求文档同步代理。src/ 下有功能文件刚刚变更，工具输入为 $ARGUMENTS。执行步骤：1) 从 tool_input.file_path 获取变更的文件路径并 Read 其内容；2) 用 Glob 列出 docs/design-docs/ 下所有文件并 Read，找到与该文件功能最相关的设计文档（按模块/功能名匹配）；3) 分析变更内容——新增、修改还是删除了哪些功能点、接口、字段或业务规则；4) 用 Edit 更新对应设计文档，在合适的章节中同步反映实际实现，保持文档与代码一致；若无明显相关文档则跳过。",
+            "statusMessage": "docs-sync：同步功能需求文档...",
+            "timeout": 120
+          },
+          {
+            "type": "command",
+            "if": "Write(src/backend/**)",
+            "command": "jq -r '.tool_input.file_path // empty' | grep -qE 'Controller\\.java$' && python3 scripts/verify/sync_api_config.py 2>&1 || true",
+            "statusMessage": "sync-api：更新接口配置...",
+            "timeout": 15
+          },
+          {
+            "type": "agent",
+            "if": "Write(src/backend/**/*Controller.java)",
+            "prompt": "你是 e2e-updater 代理。src/backend/ 下有 Controller 文件刚刚变更。执行步骤：1) 用 Glob 列出所有 *Controller.java 并逐一 Read；2) Glob 找到 ApiResponse.java 并 Read 理解响应结构；3) 分析每个端点的路径、HTTP 方法、返回类型；4) 用 Write 全量覆盖 scripts/verify/e2e_config.json，为每个 Controller 生成 scenario，每个接口生成含 expect_status 和 expect_body_contains 的 step，ApiResponse 返回时断言 code 为 0。",
+            "statusMessage": "e2e-updater：同步业务路径用例...",
+            "timeout": 120
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Edit(src/database/**)",
+            "command": "jq -r '.tool_input.file_path // empty' | grep -qE '(schema|init-data)\\.sql$' && printf '{\"systemMessage\": \"schema.sql/init-data.sql 已变更，请确认 src/database/init.sql 和 init-data.sql 是否需要同步更新\"}' || true",
+            "statusMessage": "检查数据库文件同步..."
+          },
+          {
+            "type": "agent",
+            "if": "Edit(docs/design-docs/**)",
+            "prompt": "你是 docs-updater 代理。docs/design-docs/ 下有文件刚刚变更。执行步骤：1) 用 Glob 列出 docs/design-docs/ 下所有文件并逐一 Read；2) 从中提炼项目简介、核心用户、关键业务流程、成功指标四类信息；3) 用 Edit 更新 docs/PRODUCT_SENSE.md，保持章节结构不变，用真实内容替换占位符。若 design-docs 为空则不修改 PRODUCT_SENSE.md。",
+            "statusMessage": "docs-updater：同步 PRODUCT_SENSE.md...",
+            "timeout": 120
+          },
+          {
+            "type": "command",
+            "if": "Edit(src/**)",
+            "command": "make lint-arch 2>&1",
+            "statusMessage": "lint-arch：检查分层依赖...",
+            "timeout": 30
+          },
+          {
+            "type": "agent",
+            "if": "Edit(src/**)",
+            "prompt": "你是需求文档同步代理。src/ 下有功能文件刚刚变更，工具输入为 $ARGUMENTS。执行步骤：1) 从 tool_input.file_path 获取变更的文件路径并 Read 其内容；2) 用 Glob 列出 docs/design-docs/ 下所有文件并 Read，找到与该文件功能最相关的设计文档（按模块/功能名匹配）；3) 分析变更内容——新增、修改还是删除了哪些功能点、接口、字段或业务规则；4) 用 Edit 更新对应设计文档，在合适的章节中同步反映实际实现，保持文档与代码一致；若无明显相关文档则跳过。",
+            "statusMessage": "docs-sync：同步功能需求文档...",
+            "timeout": 120
+          },
+          {
+            "type": "command",
+            "if": "Edit(src/backend/**)",
+            "command": "jq -r '.tool_input.file_path // empty' | grep -qE 'Controller\\.java$' && python3 scripts/verify/sync_api_config.py 2>&1 || true",
+            "statusMessage": "sync-api：更新接口配置...",
+            "timeout": 15
+          },
+          {
+            "type": "agent",
+            "if": "Edit(src/backend/**/*Controller.java)",
+            "prompt": "你是 e2e-updater 代理。src/backend/ 下有 Controller 文件刚刚变更。执行步骤：1) 用 Glob 列出所有 *Controller.java 并逐一 Read；2) Glob 找到 ApiResponse.java 并 Read 理解响应结构；3) 分析每个端点的路径、HTTP 方法、返回类型；4) 用 Write 全量覆盖 scripts/verify/e2e_config.json，为每个 Controller 生成 scenario，每个接口生成含 expect_status 和 expect_body_contains 的 step，ApiResponse 返回时断言 code 为 0。",
+            "statusMessage": "e2e-updater：同步业务路径用例...",
+            "timeout": 120
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(git merge *)",
+            "command": "cmd=$(jq -r '.tool_input.command // empty'); echo \"$cmd\" | grep -qE 'git merge' || exit 0; git worktree list --porcelain | awk '/^worktree /{wt=$2} /^branch /{gsub(\"refs/heads/\",\"\",$2); if (wt ~ \"\\.claude/worktrees/\") print wt \"|\"$2}' | while IFS=\"|\" read -r wt br; do git branch --merged main 2>/dev/null | grep -qxF \"  $br\" && git worktree remove \"$wt\" --force 2>/dev/null && git branch -d \"$br\" 2>/dev/null && echo \"已清理 worktree: $br\"; done 2>/dev/null || true",
+            "statusMessage": "清理已合并的 worktree...",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "if": "Bash(rm *)",
+            "command": "jq -r '.tool_input.command // empty' | grep -qE 'Controller\\.java' && python3 scripts/verify/sync_api_config.py 2>&1 || true",
+            "statusMessage": "sync-api：更新接口配置...",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "if": "Bash(git *)",
+            "command": "jq -r '.tool_input.command // empty' | grep -qE 'rm.*Controller\\.java' && python3 scripts/verify/sync_api_config.py 2>&1 || true",
+            "statusMessage": "sync-api：更新接口配置...",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

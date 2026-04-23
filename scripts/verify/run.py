@@ -61,7 +61,7 @@ CHECKS = [
 ]
 
 
-def _parse_scope(args_scope: list[str] | None, scope_file: str | None) -> set[str] | None:
+def _parse_scope(args_scope, scope_file):
     """将 CLI 的 scope 参数规范化为仓库相对 POSIX 路径集合；None 表示未指定。"""
     if not args_scope and not scope_file:
         return None

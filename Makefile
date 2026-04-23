@@ -47,8 +47,8 @@ test:
 	  echo "⚠️  tests/ 未找到，跳过 Python 集成测试"; \
 	fi
 	@if [ -d tests ]; then \
-	  echo "=== Python E2E 测试（无头）===" && cd tests && $(PYTHON3) -m pytest e2e/ -v; \
-	  echo "=== Python E2E 测试（有头）===" && cd tests && $(PYTHON3) -m pytest e2e/ -v --headed; \
+	  echo "=== Python E2E 测试（无头）===" && (cd tests && $(PYTHON3) -m pytest e2e/ -v); \
+	  echo "=== Python E2E 测试（有头）===" && (cd tests && $(PYTHON3) -m pytest e2e/ -v --headed); \
 	else \
 	  echo "⚠️  tests/ 未找到，跳过 Python E2E 测试"; \
 	fi

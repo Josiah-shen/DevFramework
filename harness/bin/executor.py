@@ -308,10 +308,15 @@ def _extract_scope_from_plan(body: str) -> list[str]:
 
 
 def _ensure_worktree_dependencies(root: Path) -> None:
-    """若当前 root 位于 worktree 下，确保前端 node_modules 与后端 target 已软链到主仓。
+    """若当前 root 位于 worktree 下，确保前端 node_modules 已软链到主仓。
 
     critic-2026-04-22 缺陷 3：worktree 默认只复制 git 跟踪文件，`src/frontend/node_modules`
     为空导致 `sh: vite: command not found`。在 verify 入口自动建立 symlink，消除人工干预。
+
+    仅软链 `src/frontend/node_modules`（只读依赖包，共享节省磁盘）；
+    `src/backend/target` 不软链，使每个 worktree 的 Maven 构建独立，避免多 worktree
+    并行时产物互踩。前端 vite/vitest 缓存通过 vite.config.js 的 cacheDir 落在
+    `src/frontend/.vite-cache`，worktree 天然隔离。
 
     策略：
     - 仅当 root 的真实路径包含 `.claude/worktrees/` 片段时才动手
@@ -340,8 +345,7 @@ def _ensure_worktree_dependencies(root: Path) -> None:
         return
 
     candidates = [
-        ("src/frontend/node_modules", "前端依赖"),
-        ("src/backend/target", "后端构建产物"),
+        ("src/frontend/node_modules", "前端依赖（只读包体积大，软链共享）"),
     ]
     for rel, desc in candidates:
         link_path = root / rel

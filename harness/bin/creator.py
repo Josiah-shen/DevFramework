@@ -50,7 +50,6 @@ REQUIRED_LINT_SCRIPTS = (
 )
 REQUIRED_MAKE_TARGETS = ("build", "test", "lint-arch", "verify", "validate")
 REQUIRED_AGENTS = (
-    "coordinator",
     "executor-research",
     "executor-code",
     "executor-shell",

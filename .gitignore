@@ -11,6 +11,8 @@ node_modules/
 dist/
 *.log
 npm-debug.log*
+.vite-cache/
+.vitest-cache/
 
 # Java / Maven
 target/
@@ -27,8 +29,14 @@ target/
 .env
 .env.local
 
-# Claude Code local state
-.claude/
+# Claude Code - 仅忽略本地运行时状态，保留框架配置入库
+.claude/*
+!.claude/agents/
+!.claude/roles/
+!.claude/settings.json
+.claude/worktrees/
+.claude/settings.local.json
+.claude/.DS_Store
 
 # Personal notes
 待办.md

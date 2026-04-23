@@ -16,7 +16,15 @@ def _run_step(base_url: str, step: dict) -> "str | None":
     url = base_url.rstrip("/") + step["path"]
     expected_status = step.get("expect_status", 200)
 
-    req = urllib.request.Request(url, method=method)
+    data = None
+    headers = {}
+    if "body" in step:
+        data = json.dumps(step["body"]).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    elif method in ("POST", "PUT", "PATCH"):
+        data = b"{}"
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     with urllib.request.urlopen(req, timeout=5) as resp:
         actual = resp.status
         body_bytes = resp.read()

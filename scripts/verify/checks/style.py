@@ -78,7 +78,7 @@ def _is_source_file(rel: str) -> bool:
     )
 
 
-def _in_scope(rel: str, scope: set[str] | None) -> bool:
+def _in_scope(rel: str, scope):  # scope: Optional[set[str]]
     """判断仓库相对路径 rel 是否落在 scope 声明范围内。
 
     - scope 为 None：全仓视为 "in scope"，保持旧行为。
@@ -103,7 +103,7 @@ def _in_scope(rel: str, scope: set[str] | None) -> bool:
     return False
 
 
-def check(strict: bool = False, scope: set[str] | None = None):
+def check(strict: bool = False, scope=None):
     """返回 (是否通过, 消息列表[, 范围外遗留])。
 
     参数：
