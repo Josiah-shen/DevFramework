@@ -1,8 +1,8 @@
 # 开发框架模板（xptsqas）
 
-> **这是什么**：一个可直接 clone 的新项目脚手架。内置**分层架构约束**、**自动化验证管道**、以及**Harness 任务引擎**——从 0 到 1 搭建新项目时只需 `./init.sh <项目名>` 即可获得一套可立刻运行、可立刻按流程交付的骨架。
+> **这是什么**：一个可直接 clone 的新项目脚手架。内置**分层架构约束**、**自动化验证管道**、**Harness 任务引擎**，以及面向 **Claude Code** 的 coordinator/子代理编排——从 0 到 1 搭建新项目时只需 `./init.sh <项目名>` 即可获得一套可立刻运行、可立刻按流程交付、可让 AI 按规范协作的骨架。
 >
-> 默认技术栈：**Spring Boot 3 + Vue 3 + MySQL 8**。可整体替换，但分层规则与 Harness 流程不随技术栈变化。
+> 默认技术栈：**Spring Boot 3 + Vue 3 + MySQL 8**。可整体替换，但分层规则、Harness 流程、Claude 协作约定不随技术栈变化。
 
 ---
 
@@ -50,6 +50,10 @@ cd src/frontend && npm install && npm run dev   # 前端
 ```
 .
 ├── CLAUDE.md                   # 给 Claude Code 的项目指令（框架约定摘要）
+├── .claude/
+│   ├── settings.json           # Claude Code hooks 配置（自动化触发规则）
+│   ├── roles/coordinator.md    # 父会话角色定义（规划、委派、验证闭环）
+│   └── agents/                 # 子代理提示词（executor-*、verifier、critic、refiner 等）
 ├── Makefile                    # build / test / lint-arch / fix-arch 等入口
 ├── init.sh                     # 模板重命名脚本（首次运行）
 ├── .env.example                # 环境变量模板
@@ -114,6 +118,45 @@ python3 harness/bin/executor.py complete <slug>    # 归档任务
 ```
 
 更多说明见 [CLAUDE.md](CLAUDE.md) 与 [harness/split-task-checklist.md](harness/split-task-checklist.md)。
+
+---
+
+## Claude Code 集成
+
+框架假设主要协作者是 [Claude Code](https://docs.claude.com/en/docs/claude-code)。Harness 是执行引擎，Claude Code 是人机界面——两者通过 `.claude/` 下的角色定义、子代理、hooks 串联。
+
+### 父会话即 Coordinator
+
+父会话默认以 **coordinator** 身份工作（见 [.claude/roles/coordinator.md](.claude/roles/coordinator.md)）：
+
+- 只做规划、委派、验证汇总，不直接 Edit/Write/Bash
+- 逃生口：任务能用一句话描述且不含"和"字时可直接动手
+- 标准闭环：理解拆解 → 构造 prompt → 委派执行 → 机械验证 → 交叉 review（按需） → 复现检测 → 汇总
+
+### 子代理（`.claude/agents/`）
+
+| 代理 | 用途 |
+|------|------|
+| `executor-research` | 只读：查代码、读文档、收集现状 |
+| `executor-code` | 写码：创建/修改源文件 |
+| `executor-shell` | 命令：build / test / 运行脚本 |
+| `executor-review` | 编码完成后的交叉审查（opus 模型） |
+| `executor-lint-rule` | 把 review 共性问题编码为 warning lint |
+| `verifier` | 跑 validate/verify 管道、排序修复建议 |
+| `critic` | 扫 `harness/trace/`，找跨任务根因 |
+| `refiner` | 按 critic 报告改进 harness 基础设施 |
+| `docs-updater` / `e2e-updater` | 事件驱动：设计文档 / Controller 变更时自动同步 |
+
+### Hooks 自动化（`.claude/settings.json`）
+
+框架预置了若干 PreToolUse/PostToolUse hooks，由 Claude Code harness 直接执行，不经 Claude：
+
+- 启动后端前自动清理 `8088` 端口旧进程
+- `src/database/schema.sql` / `init-data.sql` 变更时提醒同步 `init.sql`
+- Controller 变更自动触发 `e2e-updater` 刷新业务路径配置
+- 设计文档变更自动触发 `docs-updater` 同步 `PRODUCT_SENSE.md`
+
+需要新增"每当 X 就 Y"类的自动化时，改 `settings.json` 而不是记忆/偏好——这是硬约束。
 
 ---
 
