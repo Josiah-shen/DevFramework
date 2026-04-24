@@ -3,6 +3,16 @@
 # 将框架中所有 "xptsqas" 占位符替换为新项目名，完成后可直接启动。
 set -euo pipefail
 
+cleanup_on_error() {
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        echo ""
+        echo "⚠️  初始化中途失败（exit=$exit_code），正在清理 .bak 残留..."
+        find . "${EXCLUDE_PATHS[@]}" -name "*.bak" -delete 2>/dev/null || true
+        echo "⚠️  请运行 git status / git checkout . 检查并回滚部分替换结果。"
+    fi
+}
+
 NEW_NAME=${1:?"用法: ./init.sh <项目名>  例: ./init.sh myproject"}
 OLD_NAME="xptsqas"
 
@@ -14,6 +24,19 @@ fi
 if ! [[ "$NEW_NAME" =~ ^[a-z][a-z0-9]*$ ]]; then
     echo "❌ 项目名只能包含小写字母和数字，且必须以字母开头（不含连字符）"
     exit 1
+fi
+
+# 幂等性与工作区检查
+if [ ! -d "src/backend/src/main/java/com/xptsqas" ]; then
+    echo "❌ 未找到 com/xptsqas 包目录；此仓库可能已初始化过，或不是模板仓库。"
+    exit 1
+fi
+
+if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "❌ 工作区有未提交改动；请先 commit 或 stash，失败时才能用 git checkout . 回滚。"
+        exit 1
+    fi
 fi
 
 OLD_PKG="com.xptsqas"
@@ -36,37 +59,41 @@ FILE_PATTERNS=(
     "Makefile" ".env.example" "Dockerfile" "nginx.conf"
 )
 
+EXCLUDE_PATHS=(
+    -not -path './.git/*'
+    -not -path '*/node_modules/*'
+    -not -path '*/target/*'
+    -not -path '*/.claude/worktrees/*'
+)
+
+trap cleanup_on_error EXIT
+
 _find_files() {
     local args=()
     for p in "${FILE_PATTERNS[@]}"; do
         args+=(-o -name "$p")
     done
     find . \
-        -not -path './.git/*' \
-        -not -path '*/node_modules/*' \
-        -not -path '*/target/*' \
-        -not -path '*/.claude/worktrees/*' \
+        "${EXCLUDE_PATHS[@]}" \
         -type f \
-        \( "${args[@]:1}" \)
+        \( "${args[@]:1}" \) \
+        -print0
 }
 
 # 三轮 sed：精确匹配，避免误替换
 echo "  → 替换 Java 包名（com.xptsqas → ${NEW_PKG}）"
-_find_files | xargs sed -i.bak "s|${OLD_PKG}|${NEW_PKG}|g"
+_find_files | xargs -0 sed -i.bak "s|${OLD_PKG}|${NEW_PKG}|g"
 
 echo "  → 替换 Java 包路径（com/xptsqas → ${NEW_PKG_PATH}）"
-_find_files | xargs sed -i.bak "s|${OLD_PKG_PATH}|${NEW_PKG_PATH}|g"
+_find_files | xargs -0 sed -i.bak "s|${OLD_PKG_PATH}|${NEW_PKG_PATH}|g"
 
 echo "  → 替换 PascalCase 类名前缀（${OLD_PASCAL} → ${NEW_PASCAL}）"
-_find_files | xargs sed -i.bak "s|${OLD_PASCAL}|${NEW_PASCAL}|g"
+_find_files | xargs -0 sed -i.bak "s|${OLD_PASCAL}|${NEW_PASCAL}|g"
 
 echo "  → 替换项目名（${OLD_NAME} → ${NEW_NAME}）"
-_find_files | xargs sed -i.bak "s|${OLD_NAME}|${NEW_NAME}|g"
+_find_files | xargs -0 sed -i.bak "s|${OLD_NAME}|${NEW_NAME}|g"
 
-find . -name "*.bak" \
-    -not -path './.git/*' \
-    -not -path '*/node_modules/*' \
-    -delete
+find . "${EXCLUDE_PATHS[@]}" -name "*.bak" -delete
 
 # 重命名 Java 包目录
 OLD_JAVA_DIR="src/backend/src/main/java/com/xptsqas"

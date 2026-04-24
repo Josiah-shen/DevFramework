@@ -39,6 +39,8 @@ make harness-audit              # harness creator 评分
 make harness-run                # harness executor check 自检
 ```
 
+确定性失败（编译错、语法错、模块缺失）会被识别并立即跳过剩余重试，详见 `harness/lib/failure_classifier.py`。扩展规则只需在 `DETERMINISTIC_PATTERNS` 追加 `(pattern, reason)` 元组；新增规则请在 `harness/tests/test_failure_classifier.py` 补正/反向用例各一条。
+
 ## 数据库命令
 
 ```bash
@@ -52,6 +54,7 @@ make db-reset                   # DROP 后重建
 - 结构化日志，禁止 `console.log` / `print()`
 - 单文件不超过 500 行
 - 命名规范：PascalCase（类型）、camelCase（函数）、kebab-case（文件名）
+- 测试文件（`*.test.*` / `*.spec.*`）例外：kebab-case 仅校验去掉末尾 `.test` / `.spec` 后的主干，与 vitest/jest 默认命名惯例一致；豁免由 [scripts/verify/checks/style.py](../scripts/verify/checks/style.py) 的 `TEST_SUFFIX_RE` 实现
 
 ## 拆分类任务
 
@@ -68,3 +71,58 @@ make db-reset                   # DROP 后重建
 - `harness/tasks/` — 任务状态和检查点
 - `harness/trace/` — 执行轨迹和失败记录
 - `harness/memory/` — 经验教训存储
+
+## 聚合查询规范
+
+统计/报表类接口优先在 SQL 层聚合，避免"全量拉取 + Java 侧 groupBy"的反模式（参考 2026-04-23 能耗统计 review：8 个指标各自 `selectEnergyStatsRaw` 全量查询再在 `EnergyStatisticsHelper` 内循环累加，初始化一次页面触发 8× 全表扫描）。
+
+**应在 SQL 层聚合**（满足任一即适用）：
+
+- 原始结果集 > 100 行，或预期随数据增长
+- 聚合列（`GROUP BY` 的列、时间维度）已有索引
+- 聚合逻辑可用 `SUM / AVG / COUNT / CASE WHEN` 表达
+- 同一条业务线需要按多个维度聚合
+
+**可在内存聚合**（需同时满足）：
+
+- 原始结果集 < 100 行，且数据量稳定
+- 聚合涉及业务规则切换、单位换算链路复杂，SQL 难以维护
+
+**反模式**：同一张表按不同维度拉全量再在 Java 侧 `stream().collect(groupingBy)`；或并发 N 个接口，每个接口后端再各自全量查询，把 O(行数) 放大为 O(N × 行数)。
+
+**建议做法**：用一条 `GROUP BY` 查询返回聚合结果；多维度用 `GROUPING SETS` 或 `CASE WHEN` 一次返回。对比示例（能耗按机构月份聚合）：
+
+```java
+// 反模式：全量取回 Java 侧分组
+List<Row> rows = mapper.selectEnergyStatsRaw(params, null);  // 全表扫描
+Map<Long, BigDecimal> byOrg = rows.stream()
+    .collect(groupingBy(Row::getOrgId,
+        mapping(Row::getAmount, reducing(ZERO, BigDecimal::add))));
+```
+
+```xml
+<!-- 推荐：SQL 预聚合，只返回聚合行 -->
+SELECT org_id,
+       DATE_FORMAT(data_date, '%Y-%m') AS period,
+       SUM(amount * et.coal_equiv_factor) AS kgce
+FROM energy_consumption ec
+JOIN energy_type et ON ec.energy_type_id = et.id
+WHERE data_date BETWEEN #{start} AND #{end}
+GROUP BY org_id, period
+```
+
+如需多指标合并，优先提供"批量聚合接口"返回一次查询结果，而非前端 `Promise.all` 并发触发多个全量接口。
+
+## 验证前置条件
+
+`make validate` / `make verify` 的 `接口存活` 与 `业务路径` 两项依赖后端在
+`127.0.0.1:8088` 监听。后端离线时管道会 fail-fast 并打印启动指引，不会
+"静默跳过"。
+
+本地启动后端：
+
+    cd src/backend && mvn spring-boot:run
+
+若只想跑不依赖后端的子集：
+
+    make build && make lint-arch && make test

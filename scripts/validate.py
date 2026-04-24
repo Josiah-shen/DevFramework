@@ -3,18 +3,25 @@
 
 重试策略：
 - 若有自动修复命令：按 MAX_RETRIES 轮跑修复-重试循环。
-- 若连续两轮 stderr 指纹完全一致（即"确定性失败"，例如环境缺依赖、静态违规），
+- 一次命中"确定性失败"模式（javac 编译错、Python 语法错/模块缺失、tsc 编译错
+  等，见 harness/lib/failure_classifier.py）立即 break，无需等第二轮指纹。
+- 若连续两轮 stderr 指纹完全一致（环境缺依赖、静态违规等其他确定性失败），
   立即 break 跳过剩余重试，直接进入人工介入分支，避免噪音。
 - 同一指纹的第二次及之后的输出只打印指纹引用，不再全量复制错误文本。
 """
 
 import hashlib
+import socket
 import subprocess
 import sys
 from pathlib import Path
 from typing import List, Optional
 
 ROOT = Path(__file__).parent.parent
+# 让 harness/lib 可被 import（validate.py 位于 scripts/，与 harness/ 平级）
+sys.path.insert(0, str(ROOT))
+from harness.lib.failure_classifier import is_deterministic_failure  # noqa: E402
+
 MAX_RETRIES = 3
 # 连续相同指纹触发早退的阈值（critic-2026-04-22 缺陷 2：3 轮全跑是噪音，2 轮即可判定确定性失败）
 DETERMINISTIC_FAIL_THRESHOLD = 2
@@ -55,6 +62,20 @@ def run_with_fix(step_cmd: List[str], fix_cmd: Optional[List[str]], label: str) 
         )
         if ok:
             return True
+
+        # 确定性失败优先早退：编译错、语法错、模块缺失等重试无意义的失败，
+        # 一次命中即刻 break，不再等"连续两轮相同指纹"。
+        det_reason = is_deterministic_failure(output)
+        if det_reason is not None:
+            remaining = MAX_RETRIES + 1 - attempt
+            print(
+                f"\n[verify] 检测到确定性失败（reason={det_reason}），"
+                f"跳过剩余重试 {remaining}/{MAX_RETRIES}。"
+            )
+            print(f"\n🛑 [{label}] 确定性失败，需要人工介入：")
+            print(f"   运行命令: {' '.join(step_cmd)}")
+            print(f"   错误摘要:\n{_indent(output)}")
+            return False
 
         fp = fingerprint(output)
 
@@ -97,6 +118,15 @@ def _indent(text: str, prefix: str = "     ") -> str:
     return "\n".join(prefix + line for line in text.splitlines())
 
 
+def _backend_available(host: str = "127.0.0.1", port: int = 8088, timeout: float = 2.0) -> bool:
+    """TCP 探测后端是否在监听。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (ConnectionRefusedError, OSError, socket.timeout):
+        return False
+
+
 def main() -> int:
     # (验证命令, 修复命令或 None, 标签)
     steps = [
@@ -107,6 +137,12 @@ def main() -> int:
     ]
 
     for step_cmd, fix_cmd, label in steps:
+        if "verify" in label and not _backend_available():
+            print("\n❌ 后端未在 127.0.0.1:8088 监听，无法执行业务路径验证。")
+            print("   请先启动后端（参考 docs/DEVELOPMENT.md → 验证前置条件）：")
+            print("     cd src/backend && mvn spring-boot:run")
+            print("   或仅跑不依赖后端的子集：make build && make lint-arch && make test")
+            return 1
         if not run_with_fix(step_cmd, fix_cmd, label):
             print(f"\n❌ 管道终止于 [{label.split('—')[0].strip()}]")
             return 1

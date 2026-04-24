@@ -35,7 +35,7 @@ def check() -> tuple[bool, list[str]]:
             if e.code != expected:
                 failures.append(f"{method} {url}: 期望 HTTP {expected}，实际 {e.code}")
         except (ConnectionRefusedError, OSError):
-            return True, [f"⚠️  服务未启动，跳过接口存活检查（{base}）"]
+            return False, [f"❌ 服务未启动（{base}），无法验证接口存活"]
         except Exception as e:
             failures.append(f"{method} {url}: 连接失败 — {e}")
 

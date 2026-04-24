@@ -23,12 +23,15 @@ REVERSE_MAPPINGS=(
 #       纯业务/模板专属文件 → 不要加（见 sync-upstream.md 判定标准）
 # ============================================================
 MANIFEST=(
+    # --- Harness 引擎（Python 源码 + 任务拆分清单） ---
     "harness/bin/__init__.py"
     "harness/bin/executor.py"
     "harness/bin/creator.py"
     "harness/bin/rubric.py"
     "harness/bin/state.py"
     "harness/split-task-checklist.md"
+
+    # --- 验证脚本（validate / lint / verify 子检查） ---
     "scripts/validate.py"
     "scripts/lint-deps.py"
     "scripts/verify/run.py"
@@ -37,16 +40,24 @@ MANIFEST=(
     "scripts/verify/checks/arch.py"
     "scripts/verify/checks/e2e.py"
     "scripts/verify/checks/style.py"
+
+    # --- 根目录构建与运行时配置 ---
     "docs/DEVELOPMENT.md"
     "Makefile"
     "init.sh"
     "CLAUDE.md"
+
+    # --- 测试框架（pytest 配置与依赖） ---
     "tests/conftest.py"
     "tests/pytest.ini"
     "tests/requirements.txt"
     ".gitignore"
+
+    # --- Claude Code 配置：settings 与 coordinator 角色 ---
     ".claude/settings.json"
     ".claude/roles/coordinator.md"
+
+    # --- Claude Code agent 定义（子代理提示词） ---
     ".claude/agents/critic.md"
     ".claude/agents/docs-updater.md"
     ".claude/agents/e2e-updater.md"
@@ -57,6 +68,8 @@ MANIFEST=(
     ".claude/agents/executor-shell.md"
     ".claude/agents/refiner.md"
     ".claude/agents/verifier.md"
+
+    # --- 运维手册（playbooks：同步与重建） ---
     "docs/playbooks/sync-upstream.md"
     "docs/playbooks/sync-upstream.sh"
     "docs/playbooks/rebuild-from-source.md"

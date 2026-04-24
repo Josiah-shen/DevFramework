@@ -37,3 +37,4 @@ Layer 4: api/ ui/                            → 接口层，依赖 Layer 0-3，
 - 结构化日志，禁止 console.log / print()
 - 单文件不超过 500 行
 - PascalCase（类型）、camelCase（函数）、kebab-case（文件名）
+- 测试文件（`*.test.*` / `*.spec.*`）例外：kebab-case 仅校验去掉末尾 `.test` / `.spec` 后的主干（vitest/jest 命名惯例）

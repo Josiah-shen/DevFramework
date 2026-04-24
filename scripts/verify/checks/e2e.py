@@ -62,7 +62,7 @@ def check() -> tuple[bool, list[str]]:
                 if err:
                     failures.append(f"[{name}] {err}")
             except (ConnectionRefusedError, OSError):
-                return True, [f"⚠️  服务未启动，跳过端到端验证（{base_url}）"]
+                return False, [f"❌ 服务未启动（{base_url}），无法验证业务路径"]
             except urllib.error.HTTPError as e:
                 expected = step.get("expect_status", 200)
                 if e.code != expected:

@@ -49,6 +49,10 @@ FORBIDDEN_WARNING_RE = re.compile(
     r"|\.printStackTrace\s*\("
 )
 KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+# 测试/规格文件后缀豁免：Vitest/Jest 默认匹配 *.test.* 和 *.spec.*，
+# path.stem 会把 url.test.js 解析成 url.test（含点号），正则据此剥离后缀。
+# 仅豁免末尾恰好为 .test / .spec 的情况，其它多点文件名仍按 kebab-case 校验。
+TEST_SUFFIX_RE = re.compile(r"^(?P<base>.+)\.(?:test|spec)$")
 
 # 日志基础设施白名单：该文件是 logger 的底层实现，允许调用 console。
 # 只针对这一个文件，不扩大适用范围。
@@ -134,8 +138,12 @@ def check(strict: bool = False, scope=None):
 
             stem = path.stem
 
-            if ext not in {".java", ".vue"} and stem not in EXEMPT_STEMS and not KEBAB_RE.match(stem):
-                err_bucket.append(f"{rel}: 文件名非 kebab-case（{stem}）")
+            if ext not in {".java", ".vue"} and stem not in EXEMPT_STEMS:
+                # 对 *.test.* / *.spec.* 剥离后缀后再校验，其它情况按原规则
+                test_match = TEST_SUFFIX_RE.match(stem)
+                name_to_check = test_match.group("base") if test_match else stem
+                if not KEBAB_RE.match(name_to_check):
+                    err_bucket.append(f"{rel}: 文件名非 kebab-case（{stem}）")
 
             try:
                 lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
