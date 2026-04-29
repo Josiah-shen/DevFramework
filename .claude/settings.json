@@ -13,6 +13,17 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 harness/bin/check_codex_routing.py",
+            "statusMessage": "校验编码委派路由...",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -59,6 +70,13 @@
             "prompt": "你是 e2e-updater 代理。src/backend/ 下有 Controller 文件刚刚变更。执行步骤：1) 用 Glob 列出所有 *Controller.java 并逐一 Read；2) Glob 找到 ApiResponse.java 并 Read 理解响应结构；3) 分析每个端点的路径、HTTP 方法、返回类型；4) 用 Write 全量覆盖 scripts/verify/e2e_config.json，为每个 Controller 生成 scenario，每个接口生成含 expect_status 和 expect_body_contains 的 step，ApiResponse 返回时断言 code 为 0。",
             "statusMessage": "e2e-updater：同步业务路径用例...",
             "timeout": 120
+          },
+          {
+            "type": "command",
+            "if": "Write(tests/e2e/test_*.py)",
+            "command": "python3 harness/bin/build_e2e_route_map.py 2>&1",
+            "statusMessage": "frontend-route-mapper：刷新 route_map.json...",
+            "timeout": 15
           }
         ]
       },
@@ -105,6 +123,13 @@
             "prompt": "你是 e2e-updater 代理。src/backend/ 下有 Controller 文件刚刚变更。执行步骤：1) 用 Glob 列出所有 *Controller.java 并逐一 Read；2) Glob 找到 ApiResponse.java 并 Read 理解响应结构；3) 分析每个端点的路径、HTTP 方法、返回类型；4) 用 Write 全量覆盖 scripts/verify/e2e_config.json，为每个 Controller 生成 scenario，每个接口生成含 expect_status 和 expect_body_contains 的 step，ApiResponse 返回时断言 code 为 0。",
             "statusMessage": "e2e-updater：同步业务路径用例...",
             "timeout": 120
+          },
+          {
+            "type": "command",
+            "if": "Edit(tests/e2e/test_*.py)",
+            "command": "python3 harness/bin/build_e2e_route_map.py 2>&1",
+            "statusMessage": "frontend-route-mapper：刷新 route_map.json...",
+            "timeout": 15
           }
         ]
       },

@@ -52,12 +52,64 @@ def _load_check_closeable():
     spec.loader.exec_module(mod)
     return mod
 
-# label, fn, supports_scope
+
+def _load_check_spring_self_invocation():
+    """按文件名加载 check-spring-self-invocation.py（连字符名不能 import）。"""
+    spec = importlib.util.spec_from_file_location(
+        "check_spring_self_invocation",
+        Path(__file__).parent / "check-spring-self-invocation.py",
+    )
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_check_doc_sync():
+    """按文件名加载 check-doc-sync.py（连字符名不能 import）。"""
+    spec = importlib.util.spec_from_file_location(
+        "check_doc_sync",
+        Path(__file__).parent / "check-doc-sync.py",
+    )
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_check_exec_plan_paths():
+    """按文件名加载 check-exec-plan-paths.py（连字符名不能 import）。"""
+    spec = importlib.util.spec_from_file_location(
+        "check_exec_plan_paths",
+        Path(__file__).parent / "check-exec-plan-paths.py",
+    )
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_check_mockito_inline():
+    """按文件名加载 check-mockito-inline-concrete.py（连字符名不能 import）。"""
+    spec = importlib.util.spec_from_file_location(
+        "check_mockito_inline",
+        Path(__file__).parent / "check-mockito-inline-concrete.py",
+    )
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+# key, label, fn, supports_scope
 CHECKS = [
-    ("架构合规", arch.check, False),
-    ("代码规范", style.check, True),
-    ("接口存活", api.check, False),
-    ("业务路径", e2e.check, False),
+    ("arch", "架构合规", arch.check, False),
+    ("style", "代码规范", style.check, True),
+    ("api", "接口存活", api.check, True),
+    ("e2e", "业务路径", e2e.check, True),
 ]
 
 
@@ -104,6 +156,11 @@ def main() -> int:
         default=None,
         help="（可选）关联 exec-plan slug，仅用于日志输出，不影响行为。",
     )
+    parser.add_argument(
+        "--checks",
+        default=None,
+        help="逗号分隔的检查项：arch,style,api,e2e。默认全部。",
+    )
     args = parser.parse_args()
 
     # 环境变量回退：executor.py verify 通过 env 注入（因为中间有 make 间接调用）。
@@ -116,6 +173,9 @@ def main() -> int:
         args.slug = env_slug
 
     scope = _parse_scope(args.scope, args.scope_file)
+    selected_checks = None
+    if args.checks:
+        selected_checks = {item.strip() for item in args.checks.split(",") if item.strip()}
     if scope is not None:
         slug_hint = f"（slug={args.slug}）" if args.slug else ""
         print(f"ℹ️  verify 运行于 --scope 模式{slug_hint}：范围内 {len(scope)} 条路径硬失败，范围外降级为 ⚠️")
@@ -141,11 +201,59 @@ def main() -> int:
             for w in closeable_warns:
                 print(f"     {w}")
 
+    # 规则 logic/spring-self-invocation-transactional（warning 阶段，不阻塞）
+    self_inv_mod = _load_check_spring_self_invocation()
+    if self_inv_mod is not None:
+        self_inv_warns = self_inv_mod.check()
+        if self_inv_warns:
+            print(
+                f"⚠️  [{self_inv_mod.RULE_ID}] {len(self_inv_warns)} 条 self-invocation 代理失效（warning，不阻塞）："
+            )
+            for w in self_inv_warns:
+                print(f"     {w}")
+
+    # 规则 process/requirement-doc-sync（warning 阶段，不阻塞）
+    doc_sync_mod = _load_check_doc_sync()
+    if doc_sync_mod is not None:
+        doc_sync_warns = doc_sync_mod.check(scope=scope, slug=args.slug)
+        if doc_sync_warns:
+            print(f"⚠️  [doc-sync] {len(doc_sync_warns)} 条文档同步告警（warning，不阻塞）：")
+            for w in doc_sync_warns:
+                print(f"     {w}")
+
+    # 规则 process/exec-plan-path-existence（warning 阶段，不阻塞）
+    exec_plan_paths_mod = _load_check_exec_plan_paths()
+    if exec_plan_paths_mod is not None:
+        exec_plan_warns = exec_plan_paths_mod.check(slug=args.slug)
+        if exec_plan_warns:
+            print(
+                f"⚠️  [{exec_plan_paths_mod.RULE_ID}] {len(exec_plan_warns)} 条路径引用告警（warning，不阻塞）："
+            )
+            for w in exec_plan_warns:
+                print(f"     {w}")
+
+    # 规则 testing/mockito-inline-on-concrete-class（warning 阶段，不阻塞）
+    mockito_mod = _load_check_mockito_inline()
+    if mockito_mod is not None:
+        mockito_warns = mockito_mod.check()
+        if mockito_warns:
+            print(
+                f"⚠️  [{mockito_mod.RULE_ID}] {len(mockito_warns)} 条具体类 inline mock（warning，不阻塞）："
+            )
+            for w in mockito_warns:
+                print(f"     {w}")
+
     all_ok = True
-    for label, fn, supports_scope in CHECKS:
+    for key, label, fn, supports_scope in CHECKS:
+        if selected_checks is not None and key not in selected_checks:
+            continue
         if supports_scope and scope is not None:
-            # 带 scope 调用：style.check 返回 3 元组 (ok, msgs, debt)
-            ok, msgs, debt = fn(scope=scope)
+            result = fn(scope=scope)
+            if len(result) == 3:
+                ok, msgs, debt = result
+            else:
+                ok, msgs = result
+                debt = []
         else:
             # 无 scope 调用：所有 check 返回 2 元组 (ok, msgs)，debt 为空
             ok, msgs = fn()

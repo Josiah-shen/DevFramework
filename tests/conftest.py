@@ -40,17 +40,28 @@ def _db_available() -> bool:
         return False
 
 
-# 在 session 开始时做一次性检测，未启动则终止整个测试流程
-def pytest_sessionstart(session):
-    _BACKEND_UP = _backend_available()
-    _DB_UP = _db_available()
+# 在 collection 阶段按 items 的 fixturenames 检测后端/DB 依赖；
+# 纯静态单测（不引用 api_client/db_conn/page/browser）自动放行。
+_BACKEND_FIXTURES = {"api_client", "page", "browser"}
+_DB_FIXTURES = {"db_conn"}
+
+
+def pytest_collection_modifyitems(config, items):
+    """按 collected items 的 fixturenames 判断后端/DB 依赖。
+
+    纯静态测试（如 tests/unit/test_style_check.py）不引用任何 backend/db
+    fixture，自动放行；引用 api_client/db_conn/page/browser 的测试仍按
+    旧行为强制 backend/db 启动。
+    """
+    needs_backend = any(_BACKEND_FIXTURES & set(item.fixturenames) for item in items)
+    needs_db = any(_DB_FIXTURES & set(item.fixturenames) for item in items)
 
     issues = []
-    if not _DB_UP:
+    if needs_db and not _db_available():
         issues.append(
             f"  ✗ 数据库不可达  → 请先执行: make db-schema  (MySQL {DB_HOST}:{DB_PORT}/{DB_NAME})"
         )
-    if not _BACKEND_UP:
+    if needs_backend and not _backend_available():
         issues.append(
             f"  ✗ 后端服务未启动 → 请先执行: make docker-up 或手动启动后端  ({BASE_URL})"
         )
@@ -111,6 +122,13 @@ class _HttpClient:
 @pytest.fixture
 def api_client():
     return _HttpClient(BASE_URL)
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "routes(*paths): URL paths covered by this spec (used by route_map builder)",
+    )
 
 
 def pytest_addoption(parser):

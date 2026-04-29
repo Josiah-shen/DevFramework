@@ -45,5 +45,10 @@ target/
 .claude/settings.local.json
 .claude/.DS_Store
 
+# === Codex 调用日志 ===
+# codex.sh 每次调用写入的行式日志（含 stdin/stdout 全文，体积大且可能含任务上下文，不入仓）
+harness/trace/codex/
+harness/.cache/
+
 # === 个人笔记 ===
 待办.md

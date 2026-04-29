@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """层级依赖检查 — 确保各层只能向下依赖，Layer 4 模块间不得互相引用。"""
 
+from __future__ import annotations
+
+import argparse
 import re
 import sys
 from pathlib import Path
@@ -98,14 +101,59 @@ def check_file(path: Path) -> list:
     return violations
 
 
-def main() -> int:
-    violations: list[str] = []
+def _normalize_scope(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    items: list[str] = []
+    for piece in raw.split(","):
+        item = piece.strip().replace("\\", "/").removeprefix("./")
+        if item:
+            items.append(item)
+    return items
 
-    for ext in EXTENSIONS:
-        for path in ROOT.rglob(f"*{ext}"):
-            if any(p in SKIP_DIRS for p in path.parts):
-                continue
+
+def _collect_files_for_scope(scope: list[str]) -> list[Path]:
+    """根据 scope 收集待检查文件，应用 SKIP_DIRS / EXTENSIONS 过滤。"""
+    collected: set[Path] = set()
+    for item in scope:
+        target = ROOT / item
+        if target.is_file():
+            if target.suffix in EXTENSIONS and not any(p in SKIP_DIRS for p in target.parts):
+                collected.add(target)
+            continue
+        if target.is_dir():
+            for ext in EXTENSIONS:
+                for path in target.rglob(f"*{ext}"):
+                    if any(p in SKIP_DIRS for p in path.parts):
+                        continue
+                    collected.add(path)
+            continue
+        # 不存在（已删除 / 通配等）跳过
+    return sorted(collected)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="层级依赖检查")
+    parser.add_argument(
+        "--scope", default=None,
+        help="逗号分隔的影响范围（文件或目录）。缺省则全仓扫描。",
+    )
+    args = parser.parse_args()
+
+    violations: list[str] = []
+    scope = _normalize_scope(args.scope)
+
+    if scope:
+        paths = _collect_files_for_scope(scope)
+        print(f"ℹ️  lint-deps scope={len(scope)} 项，扫描 {len(paths)} 个源文件")
+        for path in paths:
             violations.extend(check_file(path))
+    else:
+        for ext in EXTENSIONS:
+            for path in ROOT.rglob(f"*{ext}"):
+                if any(p in SKIP_DIRS for p in path.parts):
+                    continue
+                violations.extend(check_file(path))
 
     if violations:
         print("❌ 层级依赖违规：")

@@ -41,6 +41,127 @@ make harness-run                # harness executor check 自检
 
 确定性失败（编译错、语法错、模块缺失）会被识别并立即跳过剩余重试，详见 `harness/lib/failure_classifier.py`。扩展规则只需在 `DETERMINISTIC_PATTERNS` 追加 `(pattern, reason)` 元组；新增规则请在 `harness/tests/test_failure_classifier.py` 补正/反向用例各一条。
 
+## E2E 测试运行
+
+### 触发与执行机制
+
+- 自动化 verify（`python3 harness/bin/executor.py verify <slug>`）会读取 exec-plan 的 `## 影响范围`，按 scope 收敛 E2E 执行范围。
+- `standard` profile 使用 scope 化路径，只运行能从影响范围推导出的 spec；`full` profile 跑全量 E2E 两轮。
+- E2E step 拆成两轮：先无头执行 `pytest tests/e2e/<spec> -v`，通过后再执行有头版本 `pytest tests/e2e/<spec> -v --headed`。
+- 两轮执行采用 fail fast：无头阶段失败时直接终止，不再进入有头阶段。
+- 本地手工全量入口保持不变：`make pytest-e2e` 仍执行无头 + 有头双轮全量。
+- 自动化 verify 的 scope 来自 exec-plan，不会从 git diff 临时猜测范围。
+- scope 中可以写目录或文件；目录命中时按该目录下相关文件继续推导。
+- 多个 scope 同时命中时取并集，任一全局路径命中都会触发全量降级。
+- E2E 未被触发时，其他 validate step 仍按原 profile 执行。
+
+### scope → spec 推导规则
+
+按以下优先级从 scope 推导 E2E spec：
+
+1. scope 直接包含 `tests/e2e/test_*.py` 时，仅运行对应 spec。
+2. scope 命中"19 项全量降级清单"路径时，全量运行 `tests/e2e`。
+3. 通过 `tests/e2e/route_map.json` 反查 `spec.keywords` / `spec.routes`，运行匹配 spec。
+4. 使用 `scripts/validate.py` 中的 `_E2E_SPEC_NAME_HINTS` 做文件名启发式兜底。
+5. 仍无法推导时，执行全量降级。
+
+开发者维护时按以下口径判断：
+
+- 明确知道覆盖 spec 时，优先把 spec 路径写入 exec-plan 的 `## 影响范围`。
+- 页面路由相关改动优先依赖 `route_map.json`，避免在 validate 中追加临时规则。
+- 文件名启发式只作为兜底，不能替代 spec 顶部的 route marker。
+- 无法确认影响面的改动应接受全量降级，不要强行缩小 scope。
+
+### 19 项全量降级清单
+
+以下路径改动视为全局影响，scope 化会降级为全量 E2E：
+
+**入口配置 (5)**：影响全局应用配置和构建过程。
+
+- `package.json`
+- `package-lock.json`
+- `index.html`
+- `vite.config.js`
+- `.eslintrc.cjs`
+
+**应用入口 (2)**：影响应用启动和顶层挂载。
+
+- `main.js`
+- `App.vue`
+
+**路由 + 全局布局 (3)**：影响全局路由解析和页面框架。
+
+- `src/frontend/src/ui/router/`
+- `AdminLayout.vue`
+- `ScreenLayout.vue`
+
+**HTTP 拦截器与服务汇总 (2)**：影响所有网络请求和服务初始化。
+
+- `http.js`
+- `index.js`
+
+**通用工具 (3)**：影响全局工具函数使用结果。
+
+- `logger.js`
+- `format.js`
+- `url.js`
+
+**公共资源 (1)**：影响全局静态资源加载。
+
+- `public/`
+
+**测试基础设施 (3)**：影响全局 E2E 测试环境。
+
+- `conftest.py`
+- `pytest.ini`
+- `requirements.txt`
+
+维护全量降级清单时遵循以下原则：
+
+- 只收录会影响多条业务路径、测试运行环境或应用启动链路的路径。
+- 单个页面、单个表单、单个业务组件不应直接加入全量降级清单。
+- 新增项必须同步说明所属类目，避免清单变成无边界的兜底集合。
+- 删除项前先确认已有 spec、route marker 和文件名启发式能覆盖原有风险。
+
+### 路由 marker 自动同步（route_map）
+
+- 每个 E2E spec 顶部声明 `pytestmark = [pytest.mark.e2e, pytest.mark.routes("/screen/dashboard", ...)]`，用 `pytest.mark.routes` 标明覆盖路由。
+- `harness/bin/build_e2e_route_map.py` 通过 ast 静态解析所有 spec，并全量重写 `tests/e2e/route_map.json`。
+- `.claude/settings.json` 的 `PostToolUse` hook 会在 Edit/Write `tests/e2e/test_*.py` 后自动调用 `build_e2e_route_map` 同步 JSON。
+- 需要手工同步时运行：
+
+```bash
+python3 harness/bin/build_e2e_route_map.py
+```
+
+同步结果需要满足以下预期：
+
+- `route_map.json` 与 spec 中的 route marker 保持同一提交内更新。
+- 每个 route marker 只描述该 spec 实际覆盖的页面路径。
+- spec 迁移或重命名后重新运行 builder，避免旧 spec key 残留。
+- hook 未触发时以手工命令结果为准，不手写 JSON。
+
+### 维护流程
+
+- **新增 spec 时**：在文件顶部添加 `pytest.mark.routes(...)`，列出该 spec 覆盖的路由；hook 会自动同步 `route_map.json`；同时在 `_E2E_SPEC_NAME_HINTS` 字典补一项作为兜底。
+- **新增前端页面/组件时**：单页面影响通常由 scope 自动覆盖；若属于全局影响路径，在 `_E2E_FULL_FALLBACK_PATHS` 添加对应路径。
+- **修改路由 marker 后**：hook 会自动重建 `route_map.json`；提交前确认 diff 中 spec 与 JSON 同步出现。
+- **调整降级范围时**：优先确认改动是否会影响应用启动、路由框架、网络层、公共工具、公共资源或测试环境；只有全局影响才加入全量降级清单。
+- **重命名 spec 时**：同步检查 `_E2E_SPEC_NAME_HINTS` 的 key 和 `route_map.json` 中的 spec 记录。
+- **删除 spec 时**：删除对应启发式兜底，并确认没有 scope 仍指向旧 spec。
+- **新增公共工具时**：先判断是否只服务单一页面；若被多业务复用，再考虑全量降级。
+- **提交前自检**：确认 spec、route marker、route_map、启发式兜底四者没有互相脱节。
+
+### 与 Makefile 入口的关系
+
+- `make pytest-e2e` / `make test-python-e2e`：开发者手工运行全量 E2E，保持无头 + 有头双轮全量。
+- 自动化 verify：使用 scope 化双轮执行，并保持 fail fast 策略。
+- `pytest-e2e-headless` 与 `pytest-e2e-headed` 是 Makefile 中的分阶段入口，供全量双轮流程复用。
+- Makefile 手工入口与自动化 verify 互不干扰；开发者需要快速验证影响范围时优先使用 verify，需要完整回归时使用 Makefile 全量入口。
+- 调试单个 spec 时可以直接调用 `pytest tests/e2e/<spec> -v`，但提交前仍以 Makefile 或 verify 结果为准。
+- CI 或 harness 中需要稳定复现时，优先使用自动化 verify 的 scope 化入口。
+- 发布前回归、路由框架调整、测试基础设施调整，应使用 Makefile 全量入口确认。
+
 ## 数据库命令
 
 ```bash

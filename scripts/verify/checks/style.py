@@ -23,6 +23,8 @@
   python3 style.py -W    # 把 warning 也升级为 error
 """
 
+from __future__ import annotations
+
 import re
 import sys
 from pathlib import Path
@@ -37,10 +39,11 @@ MAX_LINES = 500
 EXEMPT_STEMS = {"__init__", "index"}
 
 # error 级别：已稳定落地的规则（含前端 logger 迁移完成后升级的 console.warn/error/debug）
+# (?<!\.) 负向后顾：排除 a.console.xxx 等属性链调用场景（点号不阻断 \b，需显式排除）
 FORBIDDEN_ERROR_RE = re.compile(
-    r"\bconsole\.log\b"
+    r"(?<!\.)\bconsole\.log\b"
     r"|\bprint\s*\("
-    r"|\bconsole\.(warn|error|debug)\b"
+    r"|(?<!\.)\bconsole\.(warn|error|debug)\b"
 )
 # warning 级别：两阶段发布中，先浮现既有违规，稳定后再升级为 error
 FORBIDDEN_WARNING_RE = re.compile(

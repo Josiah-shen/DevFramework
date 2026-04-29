@@ -125,8 +125,11 @@ PLAN_SKELETON_BODY = """
 
 ## 影响范围
 - 受影响文件：{scope_placeholder}
+# 路径建议用反引号包裹（如 `src/foo/Bar.java`）；裸路径作为兜底也支持，
+# 但仅识别 src/ harness/ scripts/ docs/ tests/ .claude/ 开头或顶级已知文件名
 - 受影响层级：Layer {layer_placeholder}
 - 是否结构性变更：{structural_placeholder}
+# 若是结构性变更或动到公开接口（api/Controller.java、/api/、*.controller.ts、Mapper.xml、schema.sql），verify 会自动升级到 full
 
 ## 分阶段步骤
 1. {steps_placeholder}
@@ -257,15 +260,67 @@ def cmd_approve(root: Path, slug: str) -> int:
     return 0
 
 
-_SCOPE_FILE_LINE_RE = re.compile(r"`(src/[^`]+?)`|`([a-zA-Z0-9_\-/]+\.[a-zA-Z0-9]+)`")
+_SCOPE_FILE_LINE_RE = re.compile(r"`([^`]+?)`")
 _SCOPE_RANGE_HEADERS = ("## 影响范围", "## 影响范围 / 受影响文件", "受影响文件")
+
+_SCOPE_BARE_TOP_DIRS = ("src/", "harness/", "scripts/", "docs/", "tests/", ".claude/")
+_SCOPE_BARE_TOP_FILES = (
+    "Makefile",
+    "CLAUDE.md",
+    "README.md",
+    "pom.xml",
+    "package.json",
+    "tsconfig.json",
+    "pyproject.toml",
+)
+_SCOPE_BARE_PATH_RE = re.compile(
+    r"(?<![`\w./-])"
+    r"(?P<path>"
+    r"(?:src|harness|scripts|docs|tests|\.claude)/[A-Za-z0-9_./-]+"
+    r"|"
+    r"(?:Makefile|CLAUDE\.md|README\.md|pom\.xml|package\.json|tsconfig\.json|pyproject\.toml)"
+    r")"
+    r"(?![`\w])"
+)
+
+
+def _accept_scope_token(path_str: str, scope: list[str], seen: set[str]) -> None:
+    """共享的 scope 路径过滤与登记逻辑。"""
+    if not path_str:
+        return
+    if path_str.startswith(("http://", "https://")) or " " in path_str:
+        return
+    if any(ch in path_str for ch in ("*", "?", "{", "}")):
+        idx = path_str.find("*")
+        prefix = path_str[:idx].rstrip("/")
+        if prefix and prefix not in seen:
+            seen.add(prefix)
+            scope.append(prefix + "/")
+        return
+    path_str = path_str.rstrip(",.;:)（）")
+    if not path_str:
+        return
+    looks_like_path = (
+        path_str.startswith(_SCOPE_BARE_TOP_DIRS)
+        or path_str in _SCOPE_BARE_TOP_FILES
+        or "/" in path_str
+        or "." in path_str
+    )
+    if not looks_like_path:
+        return
+    if path_str not in seen:
+        seen.add(path_str)
+        scope.append(path_str)
 
 
 def _extract_scope_from_plan(body: str) -> list[str]:
     """从 exec-plan 正文提取"受影响文件"集合。
 
-    识别规则：定位"## 影响范围"段（或近似标题），直到下一个 "##" 段为止，
-    抽取其中形如 `src/...` 或 `path/to/file.ext` 的反引号包裹路径。
+    识别规则：定位"## 影响范围"段（或近似标题），直到下一个 "##" 段为止：
+    - 优先抽取反引号包裹路径（推荐写法）
+    - 当反引号匹配为空时，回退到「裸路径」识别：列表项内以 `src/` `harness/`
+      `scripts/` `docs/` `tests/` `.claude/` 开头，或顶级文件名（Makefile、
+      CLAUDE.md、pom.xml、package.json 等）
     - 忽略尾随的括号说明（如 "(1658 → 删除)"）
     - 忽略通配符条目（如 `.../*.java`）——这些会被 check-scope.py 处理
     - 返回仓库相对 POSIX 路径的去重列表
@@ -278,7 +333,6 @@ def _extract_scope_from_plan(body: str) -> list[str]:
             break
     if start is None:
         return []
-    # 找段落结束
     end = len(lines)
     for i in range(start, len(lines)):
         if lines[i].startswith("## "):
@@ -289,22 +343,68 @@ def _extract_scope_from_plan(body: str) -> list[str]:
     scope: list[str] = []
     seen: set[str] = set()
     for m in _SCOPE_FILE_LINE_RE.finditer(section):
-        path_str = m.group(1) or m.group(2)
-        if not path_str:
-            continue
-        # 过滤通配符与模糊条目
-        if any(ch in path_str for ch in ("*", "?", "{", "}")):
-            # 目录通配（如 `api/basicdata/*.java`）：取目录前缀
-            idx = path_str.find("*")
-            prefix = path_str[:idx].rstrip("/")
-            if prefix and prefix not in seen:
-                seen.add(prefix)
-                scope.append(prefix + "/")
-            continue
-        if path_str not in seen:
-            seen.add(path_str)
-            scope.append(path_str)
+        _accept_scope_token(m.group(1), scope, seen)
+
+    if scope:
+        return scope
+
+    # 反引号 0 命中时启用裸路径兜底（保持原有行为：反引号优先，仅在为空时兜底）
+    section_no_backticks = re.sub(r"`[^`]*`", " ", section)
+    for m in _SCOPE_BARE_PATH_RE.finditer(section_no_backticks):
+        _accept_scope_token(m.group("path"), scope, seen)
+
     return scope
+
+
+_PUBLIC_API_PATTERNS = (
+    re.compile(r"api/.*Controller\.java$"),
+    re.compile(r"(?:^|/)api/"),
+    re.compile(r"\.controller\.ts$"),
+    re.compile(r"mapper/.*Mapper\.xml$"),
+    re.compile(r"(?:^|/)schema\.sql$"),
+)
+
+
+def _structural_change(plan_body: str) -> bool:
+    """检测 plan body 的「## 影响范围」段是否声明「是否结构性变更：是」。"""
+    lines = plan_body.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.startswith("## ") and ("影响范围" in line or "受影响文件" in line):
+            start = i + 1
+            break
+    if start is None:
+        return False
+    end = len(lines)
+    for i in range(start, len(lines)):
+        if lines[i].startswith("## "):
+            end = i
+            break
+    section = "\n".join(lines[start:end])
+    return bool(re.search(r"是否结构性变更\s*[:：]\s*是", section))
+
+
+def _touches_public_api(scope_items: list[str]) -> bool:
+    """scope 任一条目命中公开接口模式（Controller/api/前端 controller/Mapper/schema）即返回 True。"""
+    for item in scope_items:
+        norm = item.replace("\\", "/")
+        for pattern in _PUBLIC_API_PATTERNS:
+            if pattern.search(norm):
+                return True
+    return False
+
+
+def _last_two_runs_failed(verify_runs: list) -> bool:
+    """末尾连续两条 result 含 'FAIL'（不区分大小写不必要——上游写的是 'FAIL'）即返回 True。"""
+    if not verify_runs or len(verify_runs) < 2:
+        return False
+    tail = verify_runs[-2:]
+    for entry in tail:
+        if not isinstance(entry, dict):
+            return False
+        if "FAIL" not in str(entry.get("result", "")):
+            return False
+    return True
 
 
 def _ensure_worktree_dependencies(root: Path) -> None:
@@ -368,7 +468,7 @@ def _ensure_worktree_dependencies(root: Path) -> None:
             log.warning("[worktree-deps] 软链 %s 失败：%s", rel, exc)
 
 
-def cmd_verify(root: Path, slug: str) -> int:
+def cmd_verify(root: Path, slug: str, full: bool = False) -> int:
     validate_slug(slug)
     path = plan_path(root, slug)
     if not path.is_file():
@@ -388,10 +488,8 @@ def cmd_verify(root: Path, slug: str) -> int:
 
     # 从 exec-plan 提取 scope 文件集合；未声明时回退全仓模式。
     scope_items = _extract_scope_from_plan(fm.body)
-    scope_args: list[str] = []
     if scope_items:
         log.info("verify scope: %d entries extracted from plan", len(scope_items))
-        scope_args = ["--scope", ",".join(scope_items), "--slug", slug]
     else:
         log.warning(
             "⚠️  plan %s 未声明受影响文件集合，verify 回退为全仓扫描（历史违规将硬失败）。"
@@ -404,16 +502,35 @@ def cmd_verify(root: Path, slug: str) -> int:
         log.error("scripts/validate.py not found at %s", validate_script)
         return 1
 
-    log.info("running %s ...", validate_script)
-    # validate.py 调用 make verify，通过环境变量把 scope 透传给 run.py
+    # 决策树：默认 standard，三种触发条件升级到 full。
+    profile = "full" if full else "standard"
+    if profile == "standard":
+        if _structural_change(fm.body):
+            profile = "full"
+            print("[verify] auto-escalation: standard → full (structural change)")
+        elif _touches_public_api(scope_items):
+            profile = "full"
+            print("[verify] auto-escalation: standard → full (public API in scope)")
+        elif _last_two_runs_failed(fm.data.get("verify_runs") or []):
+            profile = "full"
+            print("[verify] auto-escalation: standard → full (consecutive failures=2)")
+
+    log.info("running %s (profile=%s) ...", validate_script, profile)
+    validate_cmd = [sys.executable, str(validate_script), "--profile", profile]
+    # critic-2026-04-29 R2：full profile 也透传 scope，范围外历史违规降级为 warning。
+    # 仅 user 显式跑 `make verify`（不经此路径）才保留全仓硬失败的向后兼容。
+    if scope_items:
+        validate_cmd.extend(["--scope", ",".join(scope_items), "--slug", slug])
+
+    # validate.py 调用 verify/run.py 时仍通过环境变量保留 scope 兼容。
     env = None
-    if scope_args:
+    if scope_items:
         import os
         env = os.environ.copy()
         env["HARNESS_VERIFY_SCOPE"] = ",".join(scope_items)
         env["HARNESS_SLUG"] = slug
     proc = subprocess.run(
-        [sys.executable, str(validate_script)],
+        validate_cmd,
         cwd=str(root),
         capture_output=True,
         text=True,
@@ -444,12 +561,125 @@ def cmd_verify(root: Path, slug: str) -> int:
         "plan_path": str(path.relative_to(root)),
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    # 读 scope-drift counter，达 10 次时输出预警（不阻断，不真升级）
+    counter_path = root / "harness" / ".cache" / "scope-drift-counter.json"
+    if counter_path.is_file():
+        try:
+            cdata = json.loads(counter_path.read_text(encoding="utf-8"))
+            ccount = int(cdata.get("verify_count", 0))
+            if ccount >= 10:
+                print(
+                    f"[executor] worktree-scope-drift 连续 {ccount} 次零误报"
+                    f"（已达升级阈值，下次复盘评估升级到 error）",
+                    file=sys.stderr,
+                )
+        except Exception:
+            pass  # counter 故障不影响 verify 主流程
+
     return 0 if passed else 1
 
 
 def _tail(text: str, n: int) -> str:
     lines = (text or "").splitlines()
     return "\n".join(lines[-n:])
+
+
+def _load_check_scope_module(root: Path):
+    """动态加载 scripts/verify/check-scope.py（文件名带连字符，无法直接 import）。"""
+    import importlib.util
+
+    path = root / "scripts" / "verify" / "check-scope.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("_harness_check_scope", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:  # noqa: BLE001
+        return None
+    return module
+
+
+def _collect_smoke_scope(root: Path) -> list[str]:
+    """采集当前工作区相对仓库根的实际改动文件集合。
+
+    优先复用 check-scope.py 的 `_collect_actual_changes`（它已处理 git diff + porcelain
+    联合采集 + rename 解析）；加载失败时回退到本地 `git diff --name-only HEAD`。
+    """
+    module = _load_check_scope_module(root)
+    if module is not None:
+        collector = getattr(module, "_collect_actual_changes", None) or getattr(
+            module, "collect_actual_changes", None
+        )
+        if collector is not None:
+            try:
+                paths, err = collector("HEAD")
+            except Exception:  # noqa: BLE001
+                paths, err = set(), "exception"
+            if not err and paths:
+                return sorted(paths)
+            if not err:
+                return []
+    # fallback：纯 `git diff --name-only HEAD`
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            cwd=str(root), capture_output=True, text=True, check=False,
+        )
+        if proc.returncode == 0:
+            return sorted({p.strip() for p in proc.stdout.splitlines() if p.strip()})
+    except (FileNotFoundError, subprocess.SubprocessError):
+        pass
+    return []
+
+
+def cmd_smoke(root: Path, slug: str) -> int:
+    """简单任务的 smoke 验证：跑 arch+style 双通道，附 scope 收敛。
+
+    需求：
+    - 仅适用于 `init <slug> ... --simple` 创建的简单任务（checkpoint 含 simple: true）
+    - scope 来自当前工作区改动（git diff），无改动则跳过
+    - 退出码透传 validate.py
+    """
+    validate_slug(slug)
+    chk = checkpoint_path(root, slug)
+    if not chk.is_file():
+        log.error("checkpoint not found: %s (run init --simple first)", chk)
+        return 1
+    fm = read_plan(chk)
+    if not fm.data.get("simple"):
+        log.error("smoke is only for simple tasks (checkpoint missing `simple: true`)")
+        return 1
+
+    scope_items = _collect_smoke_scope(root)
+    if not scope_items:
+        print(f"⚠️  未检测到改动，跳过 smoke 验证 (slug={slug})")
+        return 0
+
+    validate_script = root / "scripts" / "validate.py"
+    if not validate_script.is_file():
+        log.error("scripts/validate.py not found at %s", validate_script)
+        return 1
+
+    validate_cmd = [
+        sys.executable, str(validate_script),
+        "--profile", "smoke",
+        "--scope", ",".join(scope_items),
+    ]
+    log.info("running smoke validation: scope=%d", len(scope_items))
+    proc = subprocess.run(validate_cmd, cwd=str(root))
+    stamp = datetime.now().isoformat(timespec="seconds")
+    summary = "PASS" if proc.returncode == 0 else f"FAIL (exit {proc.returncode})"
+
+    record = (
+        f"\n### {stamp} — smoke {summary}\n"
+        f"- scope ({len(scope_items)})：{', '.join(scope_items)}\n"
+    )
+    append_section(chk, "验证记录", record)
+    return proc.returncode
 
 
 def cmd_complete(root: Path, slug: str) -> int:
@@ -539,6 +769,10 @@ def main(argv: list[str] | None = None) -> int:
 
     verify_p = sub.add_parser("verify", help="run validate.py, append record")
     verify_p.add_argument("slug")
+    verify_p.add_argument("--full", action="store_true", help="run legacy full validation pipeline")
+
+    smoke_p = sub.add_parser("smoke", help="run smoke validation for simple tasks")
+    smoke_p.add_argument("slug")
 
     complete_p = sub.add_parser("complete", help="mark completed + sync checkpoint")
     complete_p.add_argument("slug")
@@ -557,7 +791,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "approve":
         return cmd_approve(root, args.slug)
     if args.command == "verify":
-        return cmd_verify(root, args.slug)
+        return cmd_verify(root, args.slug, full=args.full)
+    if args.command == "smoke":
+        return cmd_smoke(root, args.slug)
     if args.command == "complete":
         return cmd_complete(root, args.slug)
     parser.error(f"unknown command: {args.command}")

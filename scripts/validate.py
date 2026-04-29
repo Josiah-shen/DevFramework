@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""统一验证管道：build → lint-arch → test → verify，失败自动进入修复循环（最多 3 轮）。
+"""统一验证管道。
 
-重试策略：
-- 若有自动修复命令：按 MAX_RETRIES 轮跑修复-重试循环。
-- 一次命中"确定性失败"模式（javac 编译错、Python 语法错/模块缺失、tsc 编译错
-  等，见 harness/lib/failure_classifier.py）立即 break，无需等第二轮指纹。
-- 若连续两轮 stderr 指纹完全一致（环境缺依赖、静态违规等其他确定性失败），
-  立即 break 跳过剩余重试，直接进入人工介入分支，避免噪音。
-- 同一指纹的第二次及之后的输出只打印指纹引用，不再全量复制错误文本。
+默认 `make validate` 仍走 full，全量保持旧行为；harness 任务验证可传
+`--profile standard --scope ...`，按影响范围收敛构建、测试与 HTTP 验证。
 """
 
+from __future__ import annotations
+
+import argparse
 import hashlib
 import socket
 import subprocess
@@ -18,17 +16,406 @@ from pathlib import Path
 from typing import List, Optional
 
 ROOT = Path(__file__).parent.parent
-# 让 harness/lib 可被 import（validate.py 位于 scripts/，与 harness/ 平级）
 sys.path.insert(0, str(ROOT))
 from harness.lib.failure_classifier import is_deterministic_failure  # noqa: E402
 
 MAX_RETRIES = 3
-# 连续相同指纹触发早退的阈值（critic-2026-04-22 缺陷 2：3 轮全跑是噪音，2 轮即可判定确定性失败）
 DETERMINISTIC_FAIL_THRESHOLD = 2
+PROFILES = {"smoke", "standard", "full"}
 
 
-def run(cmd: List[str], label: str, suppress_output: bool = False) -> tuple:
-    """运行命令，返回 (成功与否, 合并输出)。suppress_output=True 时不回显（已知重复错误场景）。"""
+def parse_scope(raw_scope: str | None) -> list[str]:
+    if not raw_scope:
+        return []
+    return [p.strip().replace("\\", "/").removeprefix("./") for p in raw_scope.split(",") if p.strip()]
+
+
+def has_backend(scope: list[str]) -> bool:
+    return any(p.startswith("src/backend/") or p.startswith("src/database/") for p in scope)
+
+
+def has_frontend(scope: list[str]) -> bool:
+    return any(p.startswith("src/frontend/") for p in scope)
+
+
+def has_verify_tooling(scope: list[str]) -> bool:
+    return any(
+        p == "Makefile"
+        or p.startswith("scripts/verify/")
+        or p.startswith("harness/")
+        or p == "scripts/validate.py"
+        for p in scope
+    )
+
+
+def has_python_tests(scope: list[str], folder: str) -> bool:
+    return any(p.startswith(f"tests/{folder}/") for p in scope)
+
+
+# Mapper 文件名 → 业务域精确映射；未在表中的 mapper 回退到全 5 域（兼容性兜底）
+_MAPPER_DOMAINS: dict[str, set[str]] = {
+    "CarbonEmissionMapper": {"analysis", "statistics"},
+    "CarbonPathPlanMapper": {"analysis", "statistics"},
+    "CarbonPathDeviceMapper": {"analysis"},
+    "CarbonPathPlanDeviceMapper": {"analysis"},
+    "CarbonPathPlanStepMapper": {"analysis"},
+    "CarbonReportMapper": {"analysis"},
+    "CarbonReportVersionMapper": {"analysis"},
+    "AccountingModelMapper": {"analysis"},
+    "EnergyConsumptionMapper": {"analysis", "statistics"},
+    "EmissionFactorMapper": {"basic-data"},
+    "OrganizationMapper": {"basic-data"},
+    "OrgTypeMapper": {"basic-data"},
+    "RegionMapper": {"basic-data"},
+    "DataDictMapper": {"basic-data"},
+    "EnergyTypeMapper": {"basic-data", "statistics"},
+    "PvGenerationMapper": {"pv"},
+    "PvProjectMapper": {"pv"},
+    "SinkLandMapper": {"sink"},
+    "SinkLedgerMapper": {"sink"},
+    "WarningEventMapper": {"warning"},
+    "WarningRuleMapper": {"warning"},
+    "OrgEnergyProfileMapper": {"basic-data", "statistics"},
+}
+
+
+def scope_domains(scope: list[str]) -> set[str]:
+    mapping = {
+        "basicdata": "basic-data",
+        "application": "application",
+        "pv": "pv",
+        "sink": "sink",
+        "model": "model",
+        "analysis": "analysis",
+        "statistics": "statistics",
+        "dashboard": "dashboard",
+        "factor": "factor",
+        "file": "file",
+    }
+    domains: set[str] = set()
+    for item in scope:
+        parts = item.replace("\\", "/").split("/")
+        for part in parts:
+            key = part.lower()
+            if key in mapping:
+                domains.add(mapping[key])
+        # database/ 改动天然跨模块，保留全 5 域
+        if item.startswith("src/database/"):
+            domains.update({"basic-data", "statistics", "analysis", "pv", "sink"})
+        elif "mapper/" in item or "/repository/" in item.replace("\\", "/"):
+            # 提取 mapper 文件名（不含扩展名），按精确映射表收敛；未知 mapper 回退到全 5 域
+            name = Path(item).stem  # CarbonEmissionMapper.xml → CarbonEmissionMapper
+            if name in _MAPPER_DOMAINS:
+                domains.update(_MAPPER_DOMAINS[name])
+            else:
+                domains.update({"basic-data", "statistics", "analysis", "pv", "sink"})
+    return domains
+
+
+# ── E2E scope 化基础设施 ────────────────────────────────────────────────────
+
+E2E_DIR = ROOT / "tests" / "e2e"
+ROUTE_MAP_PATH = E2E_DIR / "route_map.json"
+
+# spec 文件名 → 业务关键字（route_map.json 缺失或不全时的兜底；新增 spec 时同步）
+_E2E_SPEC_NAME_HINTS: dict[str, list[str]] = {
+    "test_screen.py":              ["screen", "dashboard", "statistics", "analysis", "application"],
+    "test_screen_flow.py":         ["screen", "dashboard", "statistics", "analysis", "application"],
+    "test_dashboard.py":           ["dashboard"],
+    "test_carbon_emission_e2e.py": ["carbon-emission", "carbon-path", "accounting-report",
+                                    "analysis-report", "multi-dim"],
+    "test_basic_data_e2e.py":      ["basic-data", "org-info", "region-mgmt",
+                                    "energy-type", "factor-mgmt", "data-dict"],
+    "test_basic_data.py":          ["basic-data", "org-info"],
+    "test_statistics_e2e.py":      ["statistics", "carbon-emission", "carbon-path",
+                                    "accounting-report", "analysis-report",
+                                    "multi-dim", "energy-statistics"],
+    "test_pv_e2e.py":              ["pv", "pv-ledger", "pv-analysis"],
+    "test_warning_e2e.py":         ["warning", "warning-model", "warning-control"],
+    "test_sink_e2e.py":            ["sink", "sink-accounting", "sink-analysis"],
+}
+
+# 触发"全量降级"的全局副作用文件（基于实际目录扫描，19 项）
+_E2E_FULL_FALLBACK_PATHS = (
+    "src/frontend/package.json",
+    "src/frontend/package-lock.json",
+    "src/frontend/index.html",
+    "src/frontend/vite.config.js",
+    "src/frontend/.eslintrc.cjs",
+    "src/frontend/src/main.js",
+    "src/frontend/src/App.vue",
+    "src/frontend/src/ui/router/",
+    "src/frontend/src/ui/layouts/AdminLayout.vue",
+    "src/frontend/src/ui/layouts/ScreenLayout.vue",
+    "src/frontend/src/core/services/http.js",
+    "src/frontend/src/core/services/index.js",
+    "src/frontend/src/utils/logger.js",
+    "src/frontend/src/utils/format.js",
+    "src/frontend/src/utils/url.js",
+    "src/frontend/public/",
+    "tests/conftest.py",
+    "tests/pytest.ini",
+    "tests/requirements.txt",
+)
+
+
+def _load_route_map() -> dict:
+    """读 tests/e2e/route_map.json；缺失或解析失败返回空 dict。"""
+    import json as _json
+    if not ROUTE_MAP_PATH.is_file():
+        return {}
+    try:
+        return _json.loads(ROUTE_MAP_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _has_e2e_full_fallback(scope: list[str]) -> bool:
+    """scope 是否命中触发全量降级的全局副作用路径。"""
+    for item in scope:
+        norm = item.replace("\\", "/")
+        for trigger in _E2E_FULL_FALLBACK_PATHS:
+            if norm == trigger or (trigger.endswith("/") and norm.startswith(trigger)):
+                return True
+    return False
+
+
+def _e2e_keywords_from_scope(scope: list[str]) -> set[str]:
+    """从 scope 路径推业务关键字：views 文件名 kebab-case + scope_domains。"""
+    import re as _re
+    keywords: set[str] = set()
+    for item in scope:
+        norm = item.replace("\\", "/")
+        if "/views/screen/" in norm:
+            keywords.add("screen")
+            stem = Path(norm).stem
+            kebab = _re.sub(r"(?<!^)(?=[A-Z])", "-", stem).lower()
+            keywords.add(kebab)
+        elif "/views/admin/" in norm:
+            stem = Path(norm).stem
+            kebab = _re.sub(r"(?<!^)(?=[A-Z])", "-", stem).lower()
+            keywords.add(kebab)
+    keywords.update(scope_domains(scope))
+    return keywords
+
+
+def _scope_implies_e2e(scope: list[str]) -> bool:
+    """scope 含前端 views 或后端 api 业务文件时即使无 tests/e2e/ 也要触发 e2e。"""
+    for p in scope:
+        norm = p.replace("\\", "/")
+        if norm.startswith("src/frontend/src/ui/views/"):
+            return True
+        if norm.startswith("src/backend/src/main/java/com/xptsqas/api/"):
+            return True
+    return False
+
+
+def e2e_specs_for_scope(scope: list[str]) -> list[str]:
+    """根据 scope 推 e2e spec 文件子集。
+
+    返回 ["tests/e2e/test_xxx.py", ...] 子集 或 ["tests/e2e"] 全量降级哨兵。
+
+    优先级：spec 直命中 > 全量降级 > route_map 反查 > 路由片段匹配 >
+            文件名启发兜底 > 后端业务域（已并入关键字）。任一空命中走全量降级。
+    """
+    direct = [p for p in scope if p.startswith("tests/e2e/test_") and p.endswith(".py")]
+    full_fallback = _has_e2e_full_fallback(scope)
+    if direct and not full_fallback:
+        return sorted(set(direct))
+    if full_fallback:
+        return ["tests/e2e"]
+
+    keywords = _e2e_keywords_from_scope(scope)
+    if not keywords:
+        return ["tests/e2e"]
+
+    matched: set[str] = set()
+    route_map = _load_route_map()
+    for spec_name, info in route_map.items():
+        spec_kws = set(info.get("keywords") or [])
+        spec_routes = info.get("routes") or []
+        if spec_kws & keywords:
+            matched.add(spec_name)
+            continue
+        for kw in keywords:
+            if any(kw in r for r in spec_routes):
+                matched.add(spec_name)
+                break
+
+    for spec_name, hint_kws in _E2E_SPEC_NAME_HINTS.items():
+        if spec_name in matched:
+            continue
+        if set(hint_kws) & keywords:
+            matched.add(spec_name)
+
+    if not matched:
+        return ["tests/e2e"]
+    return sorted(f"tests/e2e/{name}" for name in matched)
+
+
+def java_test_names(scope: list[str]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in scope:
+        path = ROOT / item
+        candidates: list[Path] = []
+        if item.startswith("src/backend/src/test/") and item.endswith(".java"):
+            candidates.append(path)
+        elif item.startswith("src/backend/src/main/") and item.endswith(".java"):
+            candidates.append(ROOT / "src/backend/src/test/java" / f"{path.stem}Test.java")
+        for candidate in candidates:
+            if candidate.is_file() and candidate.stem not in seen:
+                seen.add(candidate.stem)
+                names.append(candidate.stem)
+    return names
+
+
+def _frontend_test_extensions() -> tuple[str, ...]:
+    return (".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", ".vue")
+
+
+def frontend_files_with_tests(frontend_files: list[str]) -> list[str]:
+    """从 src/frontend/ 相对路径列表中筛出"有对应测试文件"的条目。
+
+    判定规则（任一命中即视为有测试）：
+    - 改动文件本身就是 `*.test.*` / `*.spec.*`
+    - 同目录存在 `<stem>.test.<ext>` / `<stem>.spec.<ext>`
+    - 同目录 `__tests__/` 子目录存在 `<stem>.test.<ext>` / `<stem>.spec.<ext>`
+
+    只返回有对应测试的文件，避免 vitest related --run 在无测试时硬失败。
+    """
+    base = ROOT / "src/frontend"
+    matched: list[str] = []
+    for rel in frontend_files:
+        rel_path = Path(rel)
+        stem = rel_path.stem
+        # 自身就是测试
+        if stem.endswith(".test") or stem.endswith(".spec"):
+            matched.append(rel)
+            continue
+        parent = base / rel_path.parent
+        candidates: list[Path] = []
+        for kind in ("test", "spec"):
+            for ext in _frontend_test_extensions():
+                candidates.append(parent / f"{stem}.{kind}{ext}")
+                candidates.append(parent / "__tests__" / f"{stem}.{kind}{ext}")
+        if any(c.is_file() for c in candidates):
+            matched.append(rel)
+    return matched
+
+
+def build_steps(profile: str, scope: list[str], slug: str | None = None) -> list[tuple[list[str], Optional[list[str]], str]]:
+    if profile not in PROFILES:
+        raise ValueError(f"unknown profile: {profile}")
+
+    if profile == "full":
+        e2e_targets = e2e_specs_for_scope(scope) if scope else ["tests/e2e"]
+        return [
+            (["make", "build"], None, "build     — 代码能否编译"),
+            (["make", "lint-arch"], ["make", "fix-arch"], "lint-arch — 架构和质量合规"),
+            (["make", "test-backend"], None, "backend-tests — 后端单元/集成测试"),
+            (["make", "test-frontend"], None, "frontend-tests — 前端单元测试"),
+            (["make", "test-python-unit"], None, "python-unit — Python 单元测试"),
+            (["make", "test-python-integration"], None, "python-integration — Python 集成测试"),
+            (["python3", "-m", "pytest", *e2e_targets, "-v"],
+             None, f"python-e2e-headless — Python e2e 无头（scoped {len(e2e_targets)} spec）"),
+            (["python3", "-m", "pytest", *e2e_targets, "-v", "--headed"],
+             None, f"python-e2e-headed — Python e2e 有头（scoped {len(e2e_targets)} spec）"),
+            (["make", "verify"], None, "verify    — 端到端功能验证"),
+        ]
+
+    if profile == "smoke":
+        smoke_scope = scope if scope else ["."]
+        verify_cmd = ["python3", "scripts/verify/run.py", "--scope", ",".join(smoke_scope)]
+        if slug:
+            verify_cmd.extend(["--slug", slug])
+        verify_cmd.extend(["--checks", "arch,style"])
+        return [(verify_cmd, None, "verify-smoke — 静态检查（arch + style）")]
+
+    if not scope:
+        scope = ["."]
+
+    steps: list[tuple[list[str], Optional[list[str]], str]] = []
+    backend = has_backend(scope)
+    frontend = has_frontend(scope)
+    tooling = has_verify_tooling(scope)
+
+    if backend:
+        steps.append((["mvn", "-f", "src/backend/pom.xml", "-q", "-DskipTests", "compile"], None, "backend-compile — 后端编译"))
+        tests = java_test_names(scope)
+        if tests:
+            steps.append((
+                ["mvn", "-f", "src/backend/pom.xml", "-q", f"-Dtest={','.join(tests)}", "test"],
+                None,
+                "backend-tests — 相关后端测试",
+            ))
+
+    if frontend:
+        steps.append((["npm", "--prefix", "src/frontend", "run", "build", "--silent"], None, "frontend-build — 前端构建"))
+        frontend_files = [
+            item.removeprefix("src/frontend/")
+            for item in scope
+            if item.startswith("src/frontend/") and not item.endswith("/")
+        ]
+        testable = frontend_files_with_tests(frontend_files) if frontend_files else []
+        if testable:
+            steps.append((
+                ["npm", "--prefix", "src/frontend", "run", "test:scope", "--", *testable],
+                None,
+                "frontend-tests — 前端测试",
+            ))
+        elif not frontend_files:
+            steps.append((
+                ["npm", "--prefix", "src/frontend", "run", "test", "--if-present"],
+                None,
+                "frontend-tests — 前端测试",
+            ))
+        # frontend_files 非空但无对应测试 → 跳过 frontend-tests，避免 vitest related --run 硬失败
+
+    for folder in ("unit", "integration"):
+        if has_python_tests(scope, folder):
+            steps.append((
+                ["python3", "-m", "pytest", f"tests/{folder}", "-v"],
+                None,
+                f"python-{folder} — Python {folder} 测试",
+            ))
+
+    # e2e 单独处理：拆双轮（先无头后有头），fail fast
+    if (
+        has_python_tests(scope, "e2e")
+        or _scope_implies_e2e(scope)
+        or _has_e2e_full_fallback(scope)
+    ):
+        e2e_targets = e2e_specs_for_scope(scope)
+        label_suffix = (
+            "（全量降级）" if e2e_targets == ["tests/e2e"]
+            else f"（{len(e2e_targets)} spec）"
+        )
+        steps.append((
+            ["python3", "-m", "pytest", *e2e_targets, "-v"],
+            None,
+            f"python-e2e-headless — Python e2e 无头{label_suffix}",
+        ))
+        steps.append((
+            ["python3", "-m", "pytest", *e2e_targets, "-v", "--headed"],
+            None,
+            f"python-e2e-headed — Python e2e 有头{label_suffix}",
+        ))
+
+    if tooling and not (backend or frontend):
+        steps.append((["python3", "-m", "pytest", "--noconftest", "harness/tests", "-v"], None, "harness-tests — 验证工具测试"))
+
+    if not steps:
+        steps.append((["make", "lint-arch"], ["make", "fix-arch"], "lint-arch — 架构和质量合规"))
+
+    verify_cmd = ["python3", "scripts/verify/run.py", "--scope", ",".join(scope)]
+    if slug:
+        verify_cmd.extend(["--slug", slug])
+    steps.append((verify_cmd, None, f"verify-{profile} — scoped verify"))
+    return steps
+
+
+def run(cmd: List[str], label: str, suppress_output: bool = False) -> tuple[bool, str]:
     print(f"\n=== {label} ===")
     result = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     output = (result.stdout + result.stderr).strip()
@@ -42,18 +429,10 @@ def fingerprint(text: str) -> str:
 
 
 def run_with_fix(step_cmd: List[str], fix_cmd: Optional[List[str]], label: str) -> bool:
-    """
-    运行一个步骤，失败时执行修复循环。
-
-    提前退出条件（critic-2026-04-22 缺陷 2）：
-    - 连续两轮指纹一致 → 判定为确定性失败，跳过剩余重试直接报人工介入。
-    - 第二次及以后相同指纹只打印指纹引用，不复制全量 stderr。
-    """
     last_fp: Optional[str] = None
     repeat_count = 0
 
-    for attempt in range(1, MAX_RETRIES + 2):  # 1 次初跑 + 最多 3 轮修复
-        # 若上一轮已产生指纹且本轮即将重复，第二次起抑制输出
+    for attempt in range(1, MAX_RETRIES + 2):
         suppress = last_fp is not None and repeat_count >= 1
         ok, output = run(
             step_cmd,
@@ -63,22 +442,16 @@ def run_with_fix(step_cmd: List[str], fix_cmd: Optional[List[str]], label: str) 
         if ok:
             return True
 
-        # 确定性失败优先早退：编译错、语法错、模块缺失等重试无意义的失败，
-        # 一次命中即刻 break，不再等"连续两轮相同指纹"。
         det_reason = is_deterministic_failure(output)
         if det_reason is not None:
             remaining = MAX_RETRIES + 1 - attempt
-            print(
-                f"\n[verify] 检测到确定性失败（reason={det_reason}），"
-                f"跳过剩余重试 {remaining}/{MAX_RETRIES}。"
-            )
+            print(f"\n[verify] 检测到确定性失败（reason={det_reason}），跳过剩余重试 {remaining}/{MAX_RETRIES}。")
             print(f"\n🛑 [{label}] 确定性失败，需要人工介入：")
             print(f"   运行命令: {' '.join(step_cmd)}")
             print(f"   错误摘要:\n{_indent(output)}")
             return False
 
         fp = fingerprint(output)
-
         if fp == last_fp:
             repeat_count += 1
             print(f"\n[retry-skip-candidate] 指纹 {fp} 与上一轮一致（连续 {repeat_count} 轮）")
@@ -86,13 +459,9 @@ def run_with_fix(step_cmd: List[str], fix_cmd: Optional[List[str]], label: str) 
             repeat_count = 1
             last_fp = fp
 
-        # 确定性失败早退：连续两轮相同指纹立即 break
         if repeat_count >= DETERMINISTIC_FAIL_THRESHOLD:
             remaining = MAX_RETRIES + 1 - attempt
-            print(
-                f"\n[retry-skip] 检测到确定性失败（指纹 {fp}），"
-                f"跳过剩余重试 {remaining}/{MAX_RETRIES}"
-            )
+            print(f"\n[retry-skip] 检测到确定性失败（指纹 {fp}），跳过剩余重试 {remaining}/{MAX_RETRIES}")
             print(f"\n🛑 [{label}] 确定性失败，需要人工介入：")
             print(f"   运行命令: {' '.join(step_cmd)}")
             print(f"   错误摘要（仅首轮完整保留）:\n{_indent(output)}")
@@ -105,8 +474,7 @@ def run_with_fix(step_cmd: List[str], fix_cmd: Optional[List[str]], label: str) 
             return False
 
         if fix_cmd:
-            round_num = attempt  # 第几轮修复
-            print(f"\n🔧 [{label}] 第 {round_num} 轮修复：{' '.join(fix_cmd)}")
+            print(f"\n🔧 [{label}] 第 {attempt} 轮修复：{' '.join(fix_cmd)}")
             subprocess.run(fix_cmd, cwd=ROOT)
         else:
             print(f"\n⚠️  [{label}] 无自动修复命令，跳过修复直接重试（若下一轮指纹重复将早退）")
@@ -119,7 +487,6 @@ def _indent(text: str, prefix: str = "     ") -> str:
 
 
 def _backend_available(host: str = "127.0.0.1", port: int = 8088, timeout: float = 2.0) -> bool:
-    """TCP 探测后端是否在监听。"""
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
@@ -127,21 +494,49 @@ def _backend_available(host: str = "127.0.0.1", port: int = 8088, timeout: float
         return False
 
 
-def main() -> int:
-    # (验证命令, 修复命令或 None, 标签)
-    steps = [
-        (["make", "build"],     None,                 "build     — 代码能否编译"),
-        (["make", "lint-arch"], ["make", "fix-arch"],  "lint-arch — 架构和质量合规"),
-        (["make", "test"],      None,                 "test      — 单元/集成测试"),
-        (["make", "verify"],    None,                 "verify    — 端到端功能验证"),
-    ]
+def needs_backend(step_cmd: list[str], profile: str, scope: list[str]) -> bool:
+    if profile == "smoke":
+        return False
+    if step_cmd[:2] == ["make", "verify"]:
+        return True
+    if step_cmd[:2] == ["python3", "scripts/verify/run.py"]:
+        checks = ""
+        if "--checks" in step_cmd:
+            checks = step_cmd[step_cmd.index("--checks") + 1]
+        if checks and "api" not in checks and "e2e" not in checks:
+            return False
+        return bool(scope_domains(scope))
+    return False
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="统一验证管道")
+    parser.add_argument("--profile", choices=sorted(PROFILES), default="full")
+    parser.add_argument("--scope", default=None, help="逗号分隔的影响范围路径")
+    parser.add_argument("--slug", default=None)
+    args = parser.parse_args(argv)
+
+    scope = parse_scope(args.scope)
+    steps = build_steps(args.profile, scope, args.slug)
+    print(f"ℹ️  validate profile={args.profile}, scope={len(scope)}")
+
+    # full profile 也透传 scope：通过环境变量注入到 `make verify` → verify/run.py，
+    # 范围外历史违规降级为 warning（与 standard 一致），范围内违规仍硬失败。
+    # `make verify` 不接 CLI scope 参数，env 是唯一稳定通道；verify/run.py 已支持 HARNESS_VERIFY_SCOPE。
+    # 用户显式跑 `make verify`（无 scope 参数）仍走全仓硬失败，向后兼容。
+    import os as _os
+    if args.profile == "full" and scope:
+        _os.environ["HARNESS_VERIFY_SCOPE"] = ",".join(scope)
+        if args.slug:
+            _os.environ["HARNESS_SLUG"] = args.slug
+        print(f"ℹ️  full profile 透传 scope（{len(scope)} 条）至 make verify，范围外历史违规降级为 ⚠️")
 
     for step_cmd, fix_cmd, label in steps:
-        if "verify" in label and not _backend_available():
+        if needs_backend(step_cmd, args.profile, scope) and not _backend_available():
             print("\n❌ 后端未在 127.0.0.1:8088 监听，无法执行业务路径验证。")
             print("   请先启动后端（参考 docs/DEVELOPMENT.md → 验证前置条件）：")
             print("     cd src/backend && mvn spring-boot:run")
-            print("   或仅跑不依赖后端的子集：make build && make lint-arch && make test")
+            print("   或使用 smoke 档：python3 scripts/validate.py --profile smoke --scope <paths>")
             return 1
         if not run_with_fix(step_cmd, fix_cmd, label):
             print(f"\n❌ 管道终止于 [{label.split('—')[0].strip()}]")
