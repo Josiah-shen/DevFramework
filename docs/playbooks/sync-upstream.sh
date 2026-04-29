@@ -7,14 +7,25 @@
 # 说明见 docs/playbooks/sync-upstream.md。
 set -euo pipefail
 
+# 自拷贝执行：脚本在 MANIFEST 中包含自身，同步时会被覆盖导致 bash 解析错误。
+# 启动时拷贝到临时文件再 exec，避免运行中文件被替换。
+if [[ -z "${_SYNC_REEXEC:-}" ]]; then
+    _tmp="$(mktemp "${TMPDIR:-/tmp}/sync-upstream.XXXXXX")"
+    cp "$0" "$_tmp"
+    chmod +x "$_tmp"
+    export _SYNC_REEXEC=1 _SYNC_ORIG_SCRIPT="$0"
+    exec bash "$_tmp" "$@"
+fi
+trap 'rm -f "${BASH_SOURCE[0]}"' EXIT
+
 # ============================================================
 # 反向映射：业务项目里的占位符 → 模板里的占位符
 # 新项目占位符（例如 com.foo.bar）加到这里一行就行。
 # 格式："<业务侧>|<模板侧>"，不含空格。
 # ============================================================
 REVERSE_MAPPINGS=(
-    "com.xptsqas|com.xptsqas"
-    "com/xptsqas|com/xptsqas"
+    "com.nanjing.carbon|com.xptsqas"
+    "com/nanjing/carbon|com/xptsqas"
 )
 
 # ============================================================
@@ -112,7 +123,7 @@ done
 
 # 默认 TO = 模板根（脚本位于 docs/playbooks/，上两级）
 if [[ -z "$TO" ]]; then
-    TO="$(cd "$(dirname "$0")/../.." && pwd)"
+    TO="$(cd "$(dirname "${_SYNC_ORIG_SCRIPT:-$0}")/../.." && pwd)"
 fi
 
 [[ ! -d "$FROM" ]] && { echo "❌ --from 路径不存在: $FROM" >&2; exit 2; }
