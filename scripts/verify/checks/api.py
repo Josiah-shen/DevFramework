@@ -80,7 +80,15 @@ def check(scope=None) -> tuple[bool, list[str]]:
         method = ep.get("method", "GET")
         expected = ep.get("status", 200)
         try:
-            req = urllib.request.Request(url, method=method)
+            data = None
+            headers = {}
+            if "body" in ep:
+                data = json.dumps(ep["body"]).encode("utf-8")
+                headers["Content-Type"] = "application/json"
+            elif method in ("POST", "PUT", "PATCH"):
+                data = b"{}"
+                headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, data=data, method=method, headers=headers)
             with urllib.request.urlopen(req, timeout=5) as resp:
                 if resp.status != expected:
                     failures.append(f"{method} {url}: 期望 HTTP {expected}，实际 {resp.status}")

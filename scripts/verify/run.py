@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from checks import arch, style, api, e2e  # noqa: E402
+from checks import arch, style, api, e2e, coverage  # noqa: E402
 
 
 def _load_check_scope():
@@ -179,6 +179,13 @@ def main() -> int:
     if scope is not None:
         slug_hint = f"（slug={args.slug}）" if args.slug else ""
         print(f"ℹ️  verify 运行于 --scope 模式{slug_hint}：范围内 {len(scope)} 条路径硬失败，范围外降级为 ⚠️")
+
+    # 规则 testing/verify-coverage-drift（warning 阶段，不阻塞）
+    coverage_warns = coverage.check(scope=scope)
+    if coverage_warns:
+        print(f"⚠️  [{coverage.RULE_ID}] {len(coverage_warns)} 条 verify 覆盖缺口（warning，不阻塞）：")
+        for w in coverage_warns:
+            print(f"     {w}")
 
     # 规则 boundary/worktree-scope-drift（warning 阶段，不阻塞）
     if args.slug:

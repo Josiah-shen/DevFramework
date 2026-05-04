@@ -40,15 +40,27 @@ MANIFEST=(
     "harness/bin/creator.py"
     "harness/bin/rubric.py"
     "harness/bin/state.py"
+    "harness/bin/codex.sh"
+    "harness/bin/check_codex_routing.py"
+    "harness/bin/subagent_gate.py"
+    "harness/bin/build_e2e_route_map.py"
     "harness/split-task-checklist.md"
 
     # --- 验证脚本（validate / lint / verify 子检查） ---
     "scripts/validate.py"
     "scripts/lint-deps.py"
     "scripts/verify/run.py"
+    "scripts/verify/sync_api_config.py"
+    "scripts/verify/check-closeable-try-with-resources.py"
+    "scripts/verify/check-doc-sync.py"
+    "scripts/verify/check-exec-plan-paths.py"
+    "scripts/verify/check-mockito-inline-concrete.py"
+    "scripts/verify/check-scope.py"
+    "scripts/verify/check-spring-self-invocation.py"
     "scripts/verify/checks/__init__.py"
     "scripts/verify/checks/api.py"
     "scripts/verify/checks/arch.py"
+    "scripts/verify/checks/coverage.py"
     "scripts/verify/checks/e2e.py"
     "scripts/verify/checks/style.py"
 
@@ -69,6 +81,9 @@ MANIFEST=(
     ".claude/roles/coordinator.md"
 
     # --- Claude Code agent 定义（子代理提示词） ---
+    ".claude/agents/codex-implementer.md"
+    ".claude/agents/codex-reviewer.md"
+    ".claude/agents/codex-verifier.md"
     ".claude/agents/critic.md"
     ".claude/agents/docs-updater.md"
     ".claude/agents/e2e-updater.md"
@@ -77,6 +92,7 @@ MANIFEST=(
     ".claude/agents/executor-research.md"
     ".claude/agents/executor-review.md"
     ".claude/agents/executor-shell.md"
+    ".claude/agents/frontend-route-mapper.md"
     ".claude/agents/refiner.md"
     ".claude/agents/verifier.md"
 

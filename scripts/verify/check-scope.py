@@ -37,7 +37,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent.parent
 RULE_ID = "boundary/worktree-scope-drift"
 
-_SCOPE_FILE_LINE_RE = re.compile(r"`(src/[^`]+?)`|`([a-zA-Z0-9_\-/]+\.[a-zA-Z0-9]+)`")
+_SCOPE_FILE_LINE_RE = re.compile(r"`([^`]+?)`")
 
 
 def _extract_scope_from_plan(plan_path: Path) -> list[str]:
@@ -71,8 +71,10 @@ def _extract_scope_from_plan(plan_path: Path) -> list[str]:
     scope: list[str] = []
     seen: set[str] = set()
     for m in _SCOPE_FILE_LINE_RE.finditer(section):
-        path_str = m.group(1) or m.group(2)
+        path_str = m.group(1)
         if not path_str:
+            continue
+        if path_str.startswith(("http://", "https://")) or " " in path_str:
             continue
         if any(ch in path_str for ch in ("*", "?", "{", "}")):
             idx = path_str.find("*")
@@ -135,6 +137,32 @@ def _matches_scope(rel: str, scope_items: list[str]) -> bool:
     return False
 
 
+# 顶层目录白名单：只含一级目录前缀（如 src/、harness/）即视为过宽。
+# `src/backend/` 等二级及更深前缀不算过宽，仍可有效收敛验证。
+_TOP_LEVEL_DIR_RE = re.compile(r"^[A-Za-z0-9_.-]+/?$")
+
+
+def _is_top_level_dir(entry: str) -> bool:
+    norm = entry.replace("\\", "/")
+    if not norm.endswith("/"):
+        norm = norm + "/"
+    # 仅 1 段（首尾斜杠中间无内层斜杠）
+    inner = norm.rstrip("/")
+    return "/" not in inner and bool(_TOP_LEVEL_DIR_RE.match(norm))
+
+
+def _check_scope_too_broad(scope_items: list[str], msgs: list[str]) -> None:
+    """scope 过宽度警告：≤2 条且全部为顶层目录前缀时给出建议（warning，不阻塞）。"""
+    if not scope_items or len(scope_items) > 2:
+        return
+    if not all(_is_top_level_dir(item) for item in scope_items):
+        return
+    joined = ", ".join(scope_items)
+    msgs.append(
+        f"[boundary/scope-too-broad] scope 过宽：{joined}，建议细化到具体文件或子目录"
+    )
+
+
 def check(slug: str, base_ref: str = "main") -> list[str]:
     """核心检查函数：返回越界条目的规则化告警列表（可能为空）。"""
     plan_path = ROOT / "harness" / "exec-plans" / f"{slug}.md"
@@ -155,13 +183,71 @@ def check(slug: str, base_ref: str = "main") -> list[str]:
             f"[{RULE_ID}] <git>:0 — 无法采集实际改动（{err}）；建议：确认 git 可用、base 分支存在"
         ]
     drift = sorted(p for p in actual if not _matches_scope(p, scope_items))
-    if not drift:
-        return []
-    return [
+    msgs: list[str] = [
         f"[{RULE_ID}] {p}:0 — 此文件不在 exec-plan {slug} 声明范围内，"
         f"合并前请 `git restore` 或显式加入 `## 影响范围` 声明"
         for p in drift
     ]
+    _check_scope_too_broad(scope_items, msgs)
+    _increment_counter(zero_drift=(len(msgs) == 0))
+    return msgs
+
+
+def _increment_counter(zero_drift: bool) -> None:
+    """累计/重置 worktree-scope-drift 连续零误报次数。
+
+    并发安全：fcntl.LOCK_EX 独占锁；项目仅 macOS + Linux，无 Windows。
+    失败容错：所有异常仅 stderr 输出 WARN，不影响调用方 exit code。
+
+    Args:
+        zero_drift: True 表示本次 check 零越界（msgs 为空），+1 计数；
+                    False 表示有越界，重置为 0 并记录 last_reset_reason。
+    """
+    import fcntl
+    import json
+    from datetime import datetime, timezone
+
+    counter_path = ROOT / "harness" / ".cache" / "scope-drift-counter.json"
+    try:
+        counter_path.parent.mkdir(parents=True, exist_ok=True)
+        # 用 r+ / w+ 模式打开；不存在则先 touch
+        if not counter_path.exists():
+            counter_path.write_text("{}", encoding="utf-8")
+
+        with open(counter_path, "r+", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                raw = f.read() or "{}"
+                data = json.loads(raw) if raw.strip() else {}
+            except json.JSONDecodeError:
+                data = {}
+
+            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if zero_drift:
+                data["verify_count"] = int(data.get("verify_count", 0)) + 1
+                data["last_run"] = now_iso
+                data["last_reset_reason"] = None
+            else:
+                data["verify_count"] = 0
+                data["last_run"] = now_iso
+                data["last_reset_reason"] = "scope-drift-detected"
+
+            f.seek(0)
+            f.truncate()
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except Exception as e:
+        print(f"[{RULE_ID}] counter write failed: {e}", file=sys.stderr)
+
+
+__all__ = [
+    "_collect_actual_changes",
+    "_extract_scope_from_plan",
+    "_matches_scope",
+    "_check_scope_too_broad",
+    "_increment_counter",
+    "check",
+]
 
 
 def main() -> int:

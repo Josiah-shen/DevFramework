@@ -19,14 +19,61 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 harness/bin/subagent_gate.py enter",
+            "statusMessage": "subagent-gate：标记子代理活跃...",
+            "timeout": 3
+          },
+          {
+            "type": "command",
             "command": "python3 harness/bin/check_codex_routing.py",
             "statusMessage": "校验编码委派路由...",
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Edit(src/**)",
+            "command": "python3 harness/bin/subagent_gate.py check",
+            "statusMessage": "subagent-gate：检查 coordinator 编辑权限...",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Write(src/**)",
+            "command": "python3 harness/bin/subagent_gate.py check",
+            "statusMessage": "subagent-gate：检查 coordinator 编辑权限...",
+            "timeout": 3
+          }
+        ]
       }
     ],
     "PostToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 harness/bin/subagent_gate.py leave",
+            "statusMessage": "subagent-gate：子代理完成，更新计数...",
+            "timeout": 3
+          },
+          {
+            "type": "command",
+            "command": "python3 harness/bin/check_codex_routing.py --post",
+            "statusMessage": "codex-trace：检查 codex-implementer 是否产生调用记录...",
+            "timeout": 5
+          }
+        ]
+      },
       {
         "matcher": "Write",
         "hooks": [

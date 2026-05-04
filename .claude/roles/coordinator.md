@@ -92,7 +92,7 @@ Agent(subagent_type="executor-code", model="opus",
 
 | 条件 | 处理方式 | 检查点 |
 |------|----------|--------|
-| 能用一句话描述 **且** 描述中不含"和"字 | 直接执行 | 不需要 |
+| 能用一句话描述 **且** 描述中不含"和"字 | 直接执行（不含 `src/` 文件编辑） | 不需要 |
 | 需要清单跟踪改了哪些地方 | 委派给对应执行者 | **需要** |
 | 需要做设计决策或权衡 | 委派 + 隔离 | **需要** |
 
@@ -188,6 +188,19 @@ status: in_progress / completed
   b. 任务涉及 `.claude/`、`harness/` 自身（codex 对 harness 规则不熟，主代理直接派 executor-code 更稳）
   c. 单文件 < 30 行的小改（启动 codex 不划算）
 - **并行 research**：与 `executor-research` 并行启动的现有规则不变
+
+#### codex-implementer 静默失败检测
+
+codex-implementer 返回后，检查其报告是否包含以下任一关键词：
+- `Codex 调用日志`（正常完成）
+- `阻塞`（显式失败）
+
+**两者都不包含** → 视为静默失败（sonnet 未执行 codex.sh 流程）：
+1. 在 `.claude/.codex-implementer.log` 中查看失败原因
+2. 重试一次 codex-implementer（同一 prompt）
+3. 重试仍静默失败 → 兜底 executor-code，prompt 中声明 `兜底原因 a：codex-implementer 连续两次静默失败`
+
+> PostToolUse hook 会在 codex-implementer 完成后自动检查 `harness/trace/codex/` 是否有新文件，无则输出 warning，辅助 coordinator 判断。
 
 ### 第四步：机械验证（编码完成后立即触发）
 编码执行者（codex-implementer 或 executor-code）报告完成后，委派 `verifier`（或直接调 `python3 harness/bin/executor.py verify <slug>`）按 scope 收敛验证。executor 会从 exec-plan 的 `## 影响范围` 抽 scope 并自动选 profile：

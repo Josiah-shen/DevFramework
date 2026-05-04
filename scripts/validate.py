@@ -119,9 +119,11 @@ ROUTE_MAP_PATH = E2E_DIR / "route_map.json"
 
 # spec 文件名 → 业务关键字（route_map.json 缺失或不全时的兜底；新增 spec 时同步）
 _E2E_SPEC_NAME_HINTS: dict[str, list[str]] = {
-    "test_screen.py":              ["screen", "dashboard", "statistics", "analysis", "application"],
-    "test_screen_flow.py":         ["screen", "dashboard", "statistics", "analysis", "application"],
-    "test_dashboard.py":           ["dashboard"],
+    "test_screen.py":              ["screen", "screen-dashboard", "screen-statistics",
+                                    "screen-analysis", "screen-application"],
+    "test_screen_flow.py":         ["screen", "screen-dashboard", "screen-statistics",
+                                    "screen-analysis", "screen-application"],
+    "test_dashboard.py":           ["screen", "screen-dashboard"],
     "test_carbon_emission_e2e.py": ["carbon-emission", "carbon-path", "accounting-report",
                                     "analysis-report", "multi-dim"],
     "test_basic_data_e2e.py":      ["basic-data", "org-info", "region-mgmt",
@@ -136,6 +138,19 @@ _E2E_SPEC_NAME_HINTS: dict[str, list[str]] = {
 }
 
 # 触发"全量降级"的全局副作用文件（基于实际目录扫描，19 项）
+#
+# 触发后果：scope 命中以下任一路径时，verify 阶段会强制跑全量 e2e（≈200s/轮，
+#           可能上百用例），即便 plan 已声明 scope 也无法收敛 e2e 范围。
+#
+# 维护规则：
+#   - 仅当文件**真实影响所有页面导航或全局测试基础设施**时才入列。
+#   - 全局副作用：路由表、根布局、HTTP 客户端、全局 utils、conftest、pytest 配置等。
+#   - **纯展示文案/单页面 view/admin 子页面不入**——它们只影响局部测试，
+#     入列会导致小改动也触发全量 e2e，浪费数十分钟。
+#
+# 与 R-1 联动：harness/bin/executor.py:cmd_approve 在 plan 的 ## 影响范围 命中
+#              本列表时，会向 stderr 输出非阻塞警告（不影响 approve 切档），
+#              提醒维护者评估是否拆 commit 或临时降级到 smoke。
 _E2E_FULL_FALLBACK_PATHS = (
     "src/frontend/package.json",
     "src/frontend/package-lock.json",
@@ -238,9 +253,16 @@ def e2e_specs_for_scope(scope: list[str]) -> list[str]:
             matched.add(spec_name)
             continue
         for kw in keywords:
-            if any(kw in r for r in spec_routes):
-                matched.add(spec_name)
-                break
+            for r in spec_routes:
+                segs = [s for s in r.strip("/").split("/") if s and not s.startswith(":")]
+                is_screen = segs and segs[0] == "screen"
+                normed = [f"screen-{s}" if is_screen and s != "screen" else s for s in segs]
+                if kw in normed:
+                    matched.add(spec_name)
+                    break
+            else:
+                continue
+            break
 
     for spec_name, hint_kws in _E2E_SPEC_NAME_HINTS.items():
         if spec_name in matched:
@@ -304,41 +326,10 @@ def frontend_files_with_tests(frontend_files: list[str]) -> list[str]:
     return matched
 
 
-def build_steps(profile: str, scope: list[str], slug: str | None = None) -> list[tuple[list[str], Optional[list[str]], str]]:
-    if profile not in PROFILES:
-        raise ValueError(f"unknown profile: {profile}")
-
-    if profile == "full":
-        e2e_targets = e2e_specs_for_scope(scope) if scope else ["tests/e2e"]
-        return [
-            (["make", "build"], None, "build     — 代码能否编译"),
-            (["make", "lint-arch"], ["make", "fix-arch"], "lint-arch — 架构和质量合规"),
-            (["make", "test-backend"], None, "backend-tests — 后端单元/集成测试"),
-            (["make", "test-frontend"], None, "frontend-tests — 前端单元测试"),
-            (["make", "test-python-unit"], None, "python-unit — Python 单元测试"),
-            (["make", "test-python-integration"], None, "python-integration — Python 集成测试"),
-            (["python3", "-m", "pytest", *e2e_targets, "-v"],
-             None, f"python-e2e-headless — Python e2e 无头（scoped {len(e2e_targets)} spec）"),
-            (["python3", "-m", "pytest", *e2e_targets, "-v", "--headed"],
-             None, f"python-e2e-headed — Python e2e 有头（scoped {len(e2e_targets)} spec）"),
-            (["make", "verify"], None, "verify    — 端到端功能验证"),
-        ]
-
-    if profile == "smoke":
-        smoke_scope = scope if scope else ["."]
-        verify_cmd = ["python3", "scripts/verify/run.py", "--scope", ",".join(smoke_scope)]
-        if slug:
-            verify_cmd.extend(["--slug", slug])
-        verify_cmd.extend(["--checks", "arch,style"])
-        return [(verify_cmd, None, "verify-smoke — 静态检查（arch + style）")]
-
-    if not scope:
-        scope = ["."]
-
+def _scoped_test_steps(scope: list[str]) -> list[tuple[list[str], Optional[list[str]], str]]:
     steps: list[tuple[list[str], Optional[list[str]], str]] = []
     backend = has_backend(scope)
     frontend = has_frontend(scope)
-    tooling = has_verify_tooling(scope)
 
     if backend:
         steps.append((["mvn", "-f", "src/backend/pom.xml", "-q", "-DskipTests", "compile"], None, "backend-compile — 后端编译"))
@@ -370,7 +361,6 @@ def build_steps(profile: str, scope: list[str], slug: str | None = None) -> list
                 None,
                 "frontend-tests — 前端测试",
             ))
-        # frontend_files 非空但无对应测试 → 跳过 frontend-tests，避免 vitest related --run 硬失败
 
     for folder in ("unit", "integration"):
         if has_python_tests(scope, folder):
@@ -380,7 +370,91 @@ def build_steps(profile: str, scope: list[str], slug: str | None = None) -> list
                 f"python-{folder} — Python {folder} 测试",
             ))
 
-    # e2e 单独处理：拆双轮（先无头后有头），fail fast
+    return steps
+
+
+def build_steps(profile: str, scope: list[str], slug: str | None = None) -> list[tuple[list[str], Optional[list[str]], str]]:
+    if profile not in PROFILES:
+        raise ValueError(f"unknown profile: {profile}")
+
+    if profile == "full":
+        if scope:
+            steps: list[tuple[list[str], Optional[list[str]], str]] = [
+                (["make", "build"], None, "build     — 代码能否编译"),
+                (["make", "lint-arch"], ["make", "fix-arch"], "lint-arch — 架构和质量合规"),
+            ]
+            steps.extend(_scoped_test_steps(scope))
+
+            if (
+                has_python_tests(scope, "e2e")
+                or _scope_implies_e2e(scope)
+                or _has_e2e_full_fallback(scope)
+            ):
+                e2e_targets = e2e_specs_for_scope(scope)
+                label_suffix = (
+                    "（全量降级）" if e2e_targets == ["tests/e2e"]
+                    else f"（{len(e2e_targets)} spec）"
+                )
+                steps.append((
+                    ["python3", "-m", "pytest", *e2e_targets, "-v"],
+                    None,
+                    f"python-e2e-headless — Python e2e 无头{label_suffix}",
+                ))
+                steps.append((
+                    ["python3", "-m", "pytest", *e2e_targets, "-v", "--headed"],
+                    None,
+                    f"python-e2e-headed — Python e2e 有头{label_suffix}",
+                ))
+
+            tooling = has_verify_tooling(scope)
+            backend = has_backend(scope)
+            frontend = has_frontend(scope)
+            if tooling and not (backend or frontend):
+                steps.append((["python3", "-m", "pytest", "--noconftest", "harness/tests", "-v"], None, "harness-tests — 验证工具测试"))
+
+            verify_cmd = ["python3", "scripts/verify/run.py", "--scope", ",".join(scope)]
+            if slug:
+                verify_cmd.extend(["--slug", slug])
+            steps.append((verify_cmd, None, "verify-full — scoped verify"))
+            return steps
+        else:
+            e2e_targets = ["tests/e2e"]
+            return [
+                (["make", "build"], None, "build     — 代码能否编译"),
+                (["make", "lint-arch"], ["make", "fix-arch"], "lint-arch — 架构和质量合规"),
+                (["make", "test-backend"], None, "backend-tests — 后端单元/集成测试"),
+                (["make", "test-frontend"], None, "frontend-tests — 前端单元测试"),
+                (["make", "test-python-unit"], None, "python-unit — Python 单元测试"),
+                (["make", "test-python-integration"], None, "python-integration — Python 集成测试"),
+                (["python3", "-m", "pytest", *e2e_targets, "-v"],
+                 None, f"python-e2e-headless — Python e2e 无头（scoped {len(e2e_targets)} spec）"),
+                (["python3", "-m", "pytest", *e2e_targets, "-v", "--headed"],
+                 None, f"python-e2e-headed — Python e2e 有头（scoped {len(e2e_targets)} spec）"),
+                (["make", "verify"], None, "verify    — 端到端功能验证"),
+            ]
+
+    if profile == "smoke":
+        smoke_scope = scope if scope else ["."]
+        verify_cmd = ["python3", "scripts/verify/run.py", "--scope", ",".join(smoke_scope)]
+        if slug:
+            verify_cmd.extend(["--slug", slug])
+        verify_cmd.extend(["--checks", "arch,style"])
+        return [(verify_cmd, None, "verify-smoke — 静态检查（arch + style）")]
+
+    if not scope:
+        scope = ["."]
+
+    steps: list[tuple[list[str], Optional[list[str]], str]] = []
+    scoped_tests = _scoped_test_steps(scope)
+    if scoped_tests:
+        steps.extend(scoped_tests)
+    else:
+        steps.append((["make", "lint-arch"], ["make", "fix-arch"], "lint-arch — 架构和质量合规"))
+
+    tooling = has_verify_tooling(scope)
+    backend = has_backend(scope)
+    frontend = has_frontend(scope)
+
     if (
         has_python_tests(scope, "e2e")
         or _scope_implies_e2e(scope)
@@ -404,9 +478,6 @@ def build_steps(profile: str, scope: list[str], slug: str | None = None) -> list
 
     if tooling and not (backend or frontend):
         steps.append((["python3", "-m", "pytest", "--noconftest", "harness/tests", "-v"], None, "harness-tests — 验证工具测试"))
-
-    if not steps:
-        steps.append((["make", "lint-arch"], ["make", "fix-arch"], "lint-arch — 架构和质量合规"))
 
     verify_cmd = ["python3", "scripts/verify/run.py", "--scope", ",".join(scope)]
     if slug:

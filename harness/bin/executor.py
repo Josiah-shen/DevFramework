@@ -236,6 +236,45 @@ def cmd_plan(root: Path, slug: str) -> int:
     return 0
 
 
+def _load_e2e_full_fallback_paths(root: Path) -> tuple[str, ...]:
+    """动态加载 scripts/validate.py 的 _E2E_FULL_FALLBACK_PATHS。
+
+    用于 approve 阶段的非阻塞警告：plan 的 ## 影响范围 命中名单时，
+    提醒维护者 verify 会强制全量 e2e。加载失败（模块缺失/属性不存在/import 异常）
+    一律静默返回空元组，不让 approve 报错。
+    """
+    validate_script = root / "scripts" / "validate.py"
+    if not validate_script.is_file():
+        return ()
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_validate_for_approve", validate_script)
+        if spec is None or spec.loader is None:
+            return ()
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        paths = getattr(module, "_E2E_FULL_FALLBACK_PATHS", ())
+        if isinstance(paths, (tuple, list)):
+            return tuple(str(p) for p in paths)
+        return ()
+    except Exception:  # noqa: BLE001 — 警告功能，绝不阻塞 approve
+        return ()
+
+
+def _scope_hits_fallback(scope: list[str], fallback_paths: tuple[str, ...]) -> list[str]:
+    """返回 scope 中命中 fallback_paths 的路径列表（用于 banner 展示）。"""
+    if not fallback_paths:
+        return []
+    hits: list[str] = []
+    for item in scope:
+        norm = item.replace("\\", "/")
+        for trigger in fallback_paths:
+            if norm == trigger or (trigger.endswith("/") and norm.startswith(trigger)):
+                hits.append(item)
+                break
+    return hits
+
+
 def cmd_approve(root: Path, slug: str) -> int:
     validate_slug(slug)
     path = plan_path(root, slug)
@@ -247,6 +286,26 @@ def cmd_approve(root: Path, slug: str) -> int:
     if current != "drafted":
         log.error("approve requires status=drafted, got %r", current)
         return 1
+
+    # 非阻塞预警：plan 的 ## 影响范围 命中 _E2E_FULL_FALLBACK_PATHS 时，
+    # verify 会强制跑全量 e2e（≈200s/轮）。提示维护者评估是否拆 commit。
+    scope_items = _extract_scope_from_plan(fm.body)
+    fallback_paths = _load_e2e_full_fallback_paths(root)
+    hits = _scope_hits_fallback(scope_items, fallback_paths)
+    if hits:
+        banner_lines = [
+            "[approve] WARN e2e_full_fallback_will_trigger:",
+            "  以下文件命中 _E2E_FULL_FALLBACK_PATHS（全局副作用文件白名单），",
+            "  每次 verify 会跑全量 e2e（≈200s/轮，可能上百用例）：",
+        ]
+        for hit in hits:
+            banner_lines.append(f"    - {hit}")
+        banner_lines.append(
+            "  如本次为纯文案/注释改动，建议拆 commit 或临时降级到 smoke。"
+        )
+        banner_lines.append("  详见 scripts/validate.py:_E2E_FULL_FALLBACK_PATHS。")
+        print("\n".join(banner_lines), file=sys.stderr)
+
     fm.data["status"] = "approved"
     fm.data["approved_at"] = datetime.now().isoformat(timespec="seconds")
     write_plan(path, fm)
@@ -505,15 +564,16 @@ def cmd_verify(root: Path, slug: str, full: bool = False) -> int:
     # 决策树：默认 standard，三种触发条件升级到 full。
     profile = "full" if full else "standard"
     if profile == "standard":
+        scope_note = f"scope preserved: {len(scope_items)} paths" if scope_items else "no scope — full suite"
         if _structural_change(fm.body):
             profile = "full"
-            print("[verify] auto-escalation: standard → full (structural change)")
+            print(f"[verify] auto-escalation: standard → full (structural change, {scope_note})")
         elif _touches_public_api(scope_items):
             profile = "full"
-            print("[verify] auto-escalation: standard → full (public API in scope)")
+            print(f"[verify] auto-escalation: standard → full (public API in scope, {scope_note})")
         elif _last_two_runs_failed(fm.data.get("verify_runs") or []):
             profile = "full"
-            print("[verify] auto-escalation: standard → full (consecutive failures=2)")
+            print(f"[verify] auto-escalation: standard → full (consecutive failures=2, {scope_note})")
 
     log.info("running %s (profile=%s) ...", validate_script, profile)
     validate_cmd = [sys.executable, str(validate_script), "--profile", profile]

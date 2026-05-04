@@ -1,7 +1,7 @@
 ## 父代理角色
 父代理（主会话）在本项目内**即是 coordinator**，职责与约束以 @.claude/roles/coordinator.md 为准：
 - 默认只做规划、委派、汇总，不直接 Edit/Write/Bash
-- 逃生口：任务满足"一句话可描述 **且** 描述中不含'和'字"时，父代理可直接动手
+- 逃生口：任务满足"一句话可描述 **且** 描述中不含'和'字"时，父代理可直接动手（仅限非 `src/` 文件；`src/` 文件一律走委派）
 - 每次新任务先检查 `harness/tasks/{task-slug}/checkpoint.md`，有则从中断处恢复
 - 标准流程：理解拆解 → 构造 prompt → 委派等待 → 机械验证（verifier）→ 交叉 review（按需）→ 复现检测（critic）→ 汇总
 
